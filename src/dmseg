@@ -1,0 +1,83 @@
+#!/usr/bin/env python
+"""
+   Call DMseg.
+"""
+from __future__ import print_function
+import numpy as np
+from functools import partial
+from time import localtime, strftime
+import pandas as pd
+import sys
+import os.path as op
+
+
+def pieline (betafile, colDatafile, postionfile, maxgap=500, sd_cutoff=0.025, beta_diff_cutoff=0.05, zscore_cutoff=1.96, seed=1000, B=100):
+    sys.path.insert(0, op.join(op.dirname(__file__), ".."))
+    #sys.path.insert(0, '/fh/fast/dai_j/Programs/DMseg_python/')
+    import functions
+    print("program starts")
+    print(strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    beta = pd.read_csv(betafile, delimiter=',', index_col=0)
+    colData = pd.read_csv(colDatafile)
+    position = pd.read_csv(postionfile, delimiter=',', index_col=0)
+    chr = position['chr']
+    pos = position['position']
+    #from functions import DMsegobj
+    mydmseg=functions.DMsegobj(beta=beta, colData=colData, chr=chr,pos=pos, maxgap=maxgap,sd_cutoff=sd_cutoff,beta_diff_cutoff=beta_diff_cutoff,zscore_cutoff=zscore_cutoff,
+seed=seed, B=B)
+    mydmseg.design=mydmseg.create_design()
+    # get clusters
+    print("Get clusters")
+    mydmseg.cluster=mydmseg.clusters()
+    # filter based on sd
+    mydmseg.clustersd=mydmseg.filter_sd()
+    strftime("%Y-%m-%d %H:%M:%S", localtime())
+    # linear model fitting
+    print("Linear model fitting")
+    print(strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    mydmseg.stats=mydmseg.fit_model_probe()
+    # ROV regions (with #cpgs>1)
+    mydmseg.ROVcluster=mydmseg.create_rovcluster()
+    # ROI regions (ROV and pass other filters)
+    mydmseg.ROIcluster=mydmseg.create_roicluster()
+    # peaks and LRT for observed data
+    print("Find peaks and LRT for observed data")
+    print(strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    mydmseg.segments_alt = mydmseg.evaluate_segments_all(simulation=False)
+    print(strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    # peaks and LRT for simulation data
+    print("Find peaks and LRT for simulation data")
+    mydmseg.segments_null = mydmseg.evaluate_segments_all(simulation=True)
+    strftime("%Y-%m-%d %H:%M:%S", localtime())
+    # compute fdr/fwer
+    mydmseg.regions=mydmseg.compute_segment_p_value()
+    print("Program ends")
+    print(strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    return mydmseg
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(description=__doc__,
+                   formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    p.add_argument("-betafile", dest="betafile", help="beta matrix", required=True)
+    p.add_argument("-colDatafile", dest="colDatafile", help="colData matrix", required=True)
+    p.add_argument("-positionfile", dest="positionfile", help="position of CpGs", required=True)
+    p.add_argument("-maxgap", dest="maxgap", help="max gap to deterine clusters", default=500)
+    p.add_argument("-sd_cutoff", dest="sd_cutoff", help="SD cutoff to filter clusters", default=0.025)
+    p.add_argument("-beta_diff_cutoff", dest="beta_diff_cutoff", help="Beta difference cutoff to filter clusters", default=0.05)
+    p.add_argument("-zscore_cutoff", dest="zscore_cutoff", help="Z score cutoff to filter clusters", default=1.96)
+    p.add_argument("-seed", dest="seed", help="random seed for simulation", default=1000)
+    p.add_argument("-B", dest="B", help="number of simulation", default=100)
+    args = p.parse_args()
+    return pieline(args.betafile, args.colDatafile, args.positionfile, args.maxgap, args.sd_cutoff, args.beta_diff_cutoff, args.zscore_cutoff, args.seed, args.B)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
