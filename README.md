@@ -1,4 +1,4 @@
-###   DMseg: detecting differential methylation regions (DMRs) in methylome 
+## DMseg: detecting differential methylation regions (DMRs) in methylome 
 
 
 This is a Python package to search through methylome-side CpGs sites for DMRs between two biological conditions. The algorithm executes the following analysis steps:
@@ -9,7 +9,9 @@ This is a Python package to search through methylome-side CpGs sites for DMRs be
 
 
 To install the package: 
-```python setup.py install
+
+```
+python setup.py install
 ```
 
 To run the python package
