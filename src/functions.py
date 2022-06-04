@@ -4,537 +4,822 @@
 """
 from __future__ import print_function
 import numpy as np
-from functools import partial
+import time
 from time import localtime, strftime
 import pandas as pd
-#import argparse
-#import sys
+import re
+import multiprocessing as mp
 
-# other functions
-# function used for model fitting
-
-
-def nacomb(x):
-    tmp = np.where(np.isnan(x))
-    tmp1 = ";".join(str(v) for v in tmp[0])
-    return tmp1
-
-
-# calculate.stats, function used for model fitting
-def calculate_stats(v, na_comb, beta, design):
-    mat_sub = beta.loc[na_comb == v]
-    if v != '':
-        tmp = np.asarray(v.split(";"), dtype=np.int64)
-        mat_sub = mat_sub.drop(mat_sub.columns[tmp], axis=1)
-    design_sub = design.loc[design.index.isin(mat_sub.columns)]
-    # Calculate coef
-    M = design_sub.drop(design_sub.columns[1], axis=1)
-    M_QR_q, M_QR_r = np.linalg.qr(M)
-    S = np.diag([1]*M.shape[0]) - np.matmul(M_QR_q, M_QR_q.transpose())
-    V = design_sub.iloc[:, 1]
-    SV = np.matmul(S, V)
-    coef = np.matmul(mat_sub, np.matmul(S.transpose(), V)) / \
-        np.matmul(V.transpose(), SV)
-    # Calculate residuals
-    QR_X_q, QR_X_r = np.linalg.qr(design_sub)
-    np.allclose(design_sub, np.matmul(QR_X_q, QR_X_r))
-    resids = np.diag([1]*design_sub.shape[0]) - \
-        np.matmul(QR_X_q, QR_X_q.transpose())
-    resids = np.matmul(resids, mat_sub.transpose())
-    resids = pd.DataFrame(resids)
-    resids.set_index(mat_sub.columns, inplace=True)
-
-    # Fill the residual matrix to full size of all samples. Residuals of samples with NAs are 0.
-    removed_samples = design.index[~design.index.isin(mat_sub.columns)]
-    removed_mat = pd.DataFrame(
-        0, index=removed_samples, columns=resids.columns)
-    resids = pd.concat([resids, removed_mat])
-    resids = pd.DataFrame(resids, index=design.index)
-
-    # Calculate SE
-    tmp1 = np.linalg.inv(design_sub.T.dot(design_sub))[
-        1, 1]/(mat_sub.shape[1]-np.linalg.matrix_rank(M)-1)
-    SE = (resids.pow(2).sum()*tmp1)**(1/2)
-
-    stats_sub = pd.concat([coef, SE, coef.div(SE)], axis=1)
-    stats_sub.columns = ["coef", "sd", "zscore"]
-    result = dict(stats=stats_sub, residuals=resids)
-    return result
-
-
-# calculate LRT for observed data
-def LRT_stat(bdiff, bvar):
-    n_probes = len(bdiff)
-    cmat = np.diag(bvar)
-    sigma1 = np.linalg.inv(cmat)
-    JJ = np.ones((1, n_probes))
-    bb0 = np.linalg.inv(np.matmul(np.matmul(JJ, sigma1), JJ.T))
-    bb1 = np.matmul(np.matmul(JJ, sigma1), bdiff)
-    seg_mean = np.matmul(bb0, bb1)
-    lrt = np.matmul(np.matmul(bdiff-seg_mean, sigma1), bdiff-seg_mean)
-    lrt = np.matmul(np.matmul(bdiff, sigma1), bdiff) - lrt
-    result = dict(lrt=lrt, seg_mean=seg_mean)
-    return result
-
-
-# compute LRT for simulation
-def LRT_statall(allbdiff, allbvar):
-    sigma2 = 1/allbvar
-    tmp = np.multiply(allbdiff, allbdiff) > 0
-    tmp = tmp.astype(int)
-    #tmp1 = np.multiply(tmp, sigma2)
-    seg_mean = np.multiply(1/np.multiply(tmp, sigma2).sum(axis=1),
-                           np.multiply(np.multiply(tmp, sigma2), allbdiff).sum(axis=1))
-    lrt = np.multiply(np.multiply(np.multiply(tmp, sigma2), (allbdiff.T -
-                      np.array(seg_mean)).T), (allbdiff.T-np.array(seg_mean)).T).sum(axis=1)
-    lrt = np.multiply(np.multiply(np.multiply(tmp, sigma2),
-                      allbdiff), allbdiff).sum(axis=1) - lrt
-    result = dict(lrt=lrt, seg_mean=seg_mean)
-    return result
-
-
-# find peaks in observed data
-def get_segments(bdiff, sd, bvar, cutoff=1.96):
-    cutoff = np.array([cutoff])
-    zscore = bdiff/sd
-    assert(len(cutoff) < 2)
-    if len(cutoff) == 1:
-        cutoff = [-cutoff[0], cutoff[0]]
-    cutoff = np.sort(cutoff)
-
-    direction = np.zeros(len(zscore))
-    direction = np.where(zscore >= cutoff[1], 1, direction)
-    direction = np.where(zscore <= cutoff[0], -1, direction)
-    direction = pd.Series(direction, index=bdiff.index)
-
-    tmp0 = 1*(np.diff(direction) != 0)
-    tmp0 = np.insert(tmp0, 0, 1)
-    segments = np.cumsum(tmp0)
-    segments = pd.Series(segments, index=bdiff.index)
-    peakidx = np.where(direction.isin([-1, 1]))[0]
-    peakidx = pd.Series(peakidx, index=bdiff.index[peakidx])
-    peakidx = peakidx.to_frame()
-    peaksegments = pd.concat(
-        [peakidx, segments[peakidx.index], direction[peakidx.index]], axis=1)
-    peaksegments.columns = ['idx', 'segment', 'direction']
-    peaksegments_groupby = peaksegments.groupby(by="segment")
-    peaksegments = peaksegments_groupby.filter(lambda x: len(x) > 1)
-    peaksegments_groupby = peaksegments.groupby(by="segment")
-
-    res = pd.DataFrame(
-        columns=["start", "end", "direction", "LRT", "seg_mean"])
-    for _, segs in peaksegments_groupby:
-        # print(segs)
-        tmp2 = LRT_stat(bdiff[segs.index], bvar[segs.index])
-        res = res.append({'start': segs.idx[0], 'end': segs.idx[len(segs.idx)-1],
-                          'direction': segs.direction[0], 'LRT': tmp2['lrt'], 'seg_mean': tmp2['seg_mean']},
-                         ignore_index=True)
-    return res
-
-
-def match(a, b): return [b.index(x) if x in b else None for x in a]
-
-
-# find peaks in simulation
-def get_segmentsall(bdiff1, sd, bvar, cutoff=1.96, B=500):
-    cutoff = [cutoff]
-    if len(cutoff) == 1:
-        cutoff = np.array([-cutoff[0], cutoff[0]])
-    zscore = bdiff1/sd
-    #f = np.ones(bdiff1.shape)
-
-    direction = np.zeros(zscore.shape)
-    # direction: CpG peak indicator, based on zscore: positive 1, negative -1, others 0
-    direction = np.where(zscore >= cutoff[1], 1, direction)
-    direction = np.where(zscore <= cutoff[0], -1, direction)
-    direction = pd.DataFrame(direction, columns=sd.index, index=bdiff1.index)
-    direction = direction.astype(int)
-
-    # segments are contiguous CpGs with respect to dirrection status in each simulation (0's/1's/-1s' in direction)
-    tmp0 = 1*(np.diff(direction) != 0)
-    tmp0 = np.hstack((np.ones((tmp0.shape[0], 1)), tmp0))
-    segments = np.cumsum(tmp0, axis=1)
-    segments = pd.DataFrame(segments, columns=sd.index, index=bdiff1.index)
-    segments = segments.astype(int)
-    # check direction and segments:
-    # direction.iloc[0,:].to_list()
-    # segments.iloc[0,:].to_list()
-
-    # combinedsegments considers both direction and segments
-    combinedsegments = np.multiply(direction, segments)
-    # combinedsegments.iloc[0,:].to_list()
-    tmp1 = np.diff(combinedsegments, axis=1)
-    # a region needs to have at least 1 segment with >1 cpgs
-    idx = (tmp1 == 0).any(axis=1)
-    direction = direction[idx]
-    segments = segments[idx]
-    combinedsegments = np.multiply(direction, segments)
-    # for regions with 2 CpGs, to remove some simulation no need to check
-    # if direction.shape[1] == 2:
-    #     direction = direction[tmp1 == 0]
-    #     segments = segments[tmp1 == 0]
-
-    #pd.concat([combinedsegments, direction, segments], axis=1)
-    allres = {"lrtmax": pd.Series([None]*B), "lrt": None}
-    # allbidff can be array or dataframe, array is faster, dataframe is easier for debug
-    opt_allbidff = "array"
-    if segments.shape[0] > 0:
-        # Make sure a simulation has peaks with length > 1
-        # tmp1 contains number of CpGs in each combined segment
-        tmp1 = combinedsegments.apply(pd.Series.value_counts, axis=1).fillna(0)
-        # combined sements wiht all 0 are not peaks
-        tmp1.loc[:, 0] = 0
-        # tmp2: if combinded segments have more than 1 CpGs
-        tmp2 = tmp1 > 1
-        # simcheck=F are simulations without a peak with more than 1 CpGs, if that is the case no need to run
-        simcheck = tmp2.any(axis=1)
-        # segcheck=F are segs without a peak with more than 1 CpGs, if that is the case no need to run
-        segcheck = tmp2.any(axis=0)
-
-        if np.sum(simcheck) * np.sum(segcheck) > 0:
-            simcheck = simcheck[simcheck == True]
-            segcheck = segcheck[segcheck == True]
-            # simulations need to check
-            combinedsegments = combinedsegments.loc[simcheck.index]
-
-            # allbdiff is the combination of peaks, matrix form, each row contains one peak from a simulation (other cpgs are filled with 0)
-            # allbidff can be dataframe
-            if opt_allbidff == "dataframe":
-                allbdiff = pd.DataFrame()
-            else:
-                #allbidff is array
-                allbdiff = np.array([], dtype=np.float64).reshape(
-                    0, bdiff1.shape[1])
-                simidx = []
-            # seg are peaks with cpgs>1 to be included in allbdiff
-            for seg in segcheck.index:
-                # print(seg)
-                # row,col indices for CpGs in seg, some of them are not included in peaks with #cpgs>1
-                idx = np.where(combinedsegments == seg)
-                # print(idx)
-                # simulation (row) indices need to check (peaks with #cpg>1)
-                idx1 = tmp2.index[np.where(tmp2.loc[:, seg] == True)]
-                idx2 = np.in1d(combinedsegments.index[idx[0]], idx1)
-                # row indices need to check
-                rowidx = combinedsegments.index[idx[0][idx2]]
-                # column indeces need to check
-                colidx = combinedsegments.columns[idx[1][idx2]]
-
-                # tmp5: matrix (for seg) to fill using bdiff1 data
-                #tmp5 = pd.DataFrame(0, index=rowidx.unique(), columns=bdiff1.columns.unique())
-                tmp5 = np.zeros((len(rowidx.unique()), bdiff1.shape[1]))
-                idx1 = match(rowidx.to_list(), rowidx.unique().tolist())
-                idx2 = match(colidx.to_list(), bdiff1.columns.tolist())
-                idx11 = match(rowidx.to_list(), bdiff1.index.tolist())
-                tmp5[idx1, idx2] = bdiff1.values[idx11, idx2]
-                # tmp5 include all CpGs
-                if opt_allbidff == "dataframe":
-                    tmp5 = pd.DataFrame(
-                        tmp5, index=rowidx.unique(), columns=bdiff1.columns)
-                    allbdiff = allbdiff.append(tmp5)
-                else:
-                    allbdiff = np.vstack([allbdiff, tmp5])
-                    simidx.append(rowidx.unique().tolist())
-
-            if opt_allbidff == "dataframe":
-                simidx = allbdiff.index
-            else:
-                simidx = [x for sublist in simidx for x in sublist]
-            # max lrt in each simulation
-            lrtmax = pd.Series([None]*B)
-            if allbdiff.shape[0] > 0:
-                if opt_allbidff == "dataframe":
-                    lrtres = LRT_statall(allbdiff=allbdiff, allbvar=bvar)
-                else:
-                    lrtres = LRT_statall(
-                        allbdiff=allbdiff, allbvar=np.array(bvar))
-                lrtmax1 = pd.DataFrame(
-                    {"lrt": lrtres['lrt'], "simidx": simidx})
-                lrtmax1_groupby = lrtmax1.groupby(by="simidx")
-                lrtmax2 = lrtmax1_groupby.max()
-                lrtmax2 = lrtmax2.iloc[:, 0]
-                lrtmax.loc[lrtmax2.index] = lrtmax2
-                # lrt contains all lrt found in simulation (1 simulation can have multiple peaks and multiple lrt)
-                allres = {"lrtmax": lrtmax, "lrt": lrtres['lrt']}
-    return allres
-
-
-# class
-class DMsegobj:
-    def __init__(self, beta, colData, chr, pos, maxgap=500, sd_cutoff=0.025, beta_diff_cutoff=0.05, zscore_cutoff=1.96, seed=1000, B=100):
-        self.beta = beta
-        self.colData = colData
-        self.chr = chr
-        self.design = None
-        self.pos = pos
-        self.maxgap = maxgap
-        self.beta_diff_cutoff = beta_diff_cutoff
-        self.sd_cutoff = sd_cutoff
-        self.zscore_cutoff = zscore_cutoff
-        self.seed = seed
-        self.B = B
-        self.cluster = None
-        self.clustersd = None
-        self.stats = None
-        self.ROIcluster = None
-        self.ROVcluster = None
-        self.segments_alt = None
-        self.segments_null = None
-        self.regions = None
-
-    def create_design(self):
-        # first column is sample name, second column is group
-        intercept = pd.Series([1]*self.beta.shape[1], index=self.beta.columns)
-        group_dummy = pd.get_dummies(
-            data=self.colData.iloc[:, 1], drop_first=True)
-        group_dummy.set_index(self.beta.columns, inplace=True)
-        other_dummy = pd.get_dummies(
-            data=self.colData.iloc[:, 2:], drop_first=True)
-        other_dummy.set_index(self.beta.columns, inplace=True)
-        design = pd.concat([intercept, group_dummy, other_dummy], axis=1)
-        return design
-
-    def clusters(self):
-        tmp2 = self.chr.groupby(by=self.chr, sort=False)
-        tmp3 = tmp2.count()
-        Indexes = tmp3.cumsum().to_list()
-        Indexes.insert(0, 0)
-        clusterIDs = pd.Series(
-            data=[None]*self.pos.shape[0], index=self.chr.index)
-        Last = 0
-        for i in range(len(Indexes)-1):
-            i1 = Indexes[i]
-            i2 = Indexes[i+1]
-            Index = range(i1, i2)
-            x = self.pos.iloc[Index]
-            # sort
+#make clusters
+def clustermaker(chr, pos, assumesorted=False, maxgap=500):
+    tmp2 = chr.groupby(by=chr, sort=False)
+    tmp3 = tmp2.count()
+    Indexes = tmp3.cumsum().to_list()
+    Indexes.insert(0, 0)
+    clusterIDs = pd.Series(data=[None]*pos.shape[0], index=chr.index)
+    Last = 0
+    for i in range(len(Indexes)-1):
+        i1 = Indexes[i]
+        i2 = Indexes[i+1]
+        Index = range(i1, i2)
+        x = pos.iloc[Index]
+        if (not(assumesorted)):
             tmp = [j-1 for j in x.rank()]
             x = x.iloc[tmp]
-            y = np.diff(x) > self.maxgap
-            y = np.insert(y, 0, 1)
-            z = np.cumsum(y)
-            clusterIDs.iloc[i1:i2] = z + Last
-            Last = max(z) + Last
-        return clusterIDs
+        y = np.diff(x) > maxgap
+        y = np.insert(y, 0, 1)
+        z = np.cumsum(y)
+        clusterIDs.iloc[i1:i2] = z + Last
+        Last = max(z) + Last
+    return clusterIDs
 
-    def filter_sd(self):
-        tmp = self.cluster.groupby(self.cluster)
-        allsd = self.beta.T.std()
-        #strftime("%Y-%m-%d %H:%M:%S", localtime())
-        clustersd = tmp.filter(lambda x: allsd[x.index].max() > self.sd_cutoff)
-        # only use CpGs pass sd filter
-        self.beta = pd.DataFrame(self.beta, index=clustersd.index)
-        return clustersd
+#fit model for data
+def fit_model_probes(beta, design):
+    #use np array to save time
+    beta1 = np.array(beta)
+    design1 = np.array(design)
+    M = np.delete(design1,1,axis=1)
+    M_QR_q, M_QR_r = np.linalg.qr(M)
+    S = np.diag([1] * M.shape[0]) - np.matmul(M_QR_q, M_QR_q.transpose())
+    V = design1[:, 1]
+    SV = np.matmul(S, V)
+    coef = np.matmul(beta1, np.matmul(S.transpose(), V)) / np.matmul(V.transpose(), SV)
+    # Calculate residuals
+    QR_X_q, QR_X_r = np.linalg.qr(design)
+  
+    resids = np.diag([1] * design.shape[0]) - np.matmul(QR_X_q, QR_X_q.transpose())
+    resids = np.matmul(resids, beta1.transpose())
+ 
+    # Calculate SE
+    tmp1 = np.linalg.inv(design1.T.dot(design1))[1, 1] / (beta.shape[1] - np.linalg.matrix_rank(M) - 1)
+    SE = np.sqrt(np.multiply(resids, resids).sum(axis=0) * tmp1)
+    result = np.array([coef,SE]).T
+    return result
 
-        # model.fit
-    def fit_model_probe(self):
-        na_comb = self.beta.apply(nacomb, axis=1)
-        na_comb_unique = na_comb.unique()
-        tmp = list(map(partial(calculate_stats, na_comb=na_comb,
-                   beta=self.beta, design=self.design), na_comb_unique))
-        stats = dict()
-        stats['fit_x'] = self.design
-        stats['statistics'] = pd.DataFrame()
-        for j in range(len(tmp)):
-            stats['statistics'] = pd.concat(
-                [stats['statistics'], tmp[j]['stats']])
 
-        stats['statistics'] = pd.DataFrame(
-            stats['statistics'], index=self.beta.index)
-        stats['residuals'] = pd.DataFrame()
-        for j in range(len(tmp)):
-            stats['residuals'] = pd.concat(
-                [stats['residuals'], tmp[j]['residuals']], axis=1)
+#Search peak segments
+def Search_segments(DMseg_stats, cutoff,cutoff1):
+    zscore = DMseg_stats['Coef']/DMseg_stats['SE']
+    cutoff1 = abs(cutoff1)
+    cutoff = abs(cutoff)
+    myzscore = 1*(zscore.abs()>cutoff)
+    myzscore1 = 1*(zscore.abs()>cutoff1)
+    myzscore2 = myzscore*2 + myzscore1
+    tmp = myzscore2.to_string(index=False)
+    tmp = re.sub("\n",'',tmp)
+    if myzscore.index.name is not None:
+        tmp = re.sub(myzscore.index.name,'',tmp)
+    tmp = re.sub(" ",'',tmp)
+    #the index where a cpg in the middle has a weak signal (Z-score>zscore_cutoff1)
+    tmp1 = [_.start() for _ in re.finditer("313",tmp)]
+    if (len(tmp1)>0):
+        myzscore.iloc[np.array(tmp1)+1]=1
+    #direction: 1 if cpg has zscore > cutoff, 0 abs(zscore) < cutoff, -1 if zscore < -cutoff 
+    direction = np.zeros(DMseg_stats.shape[0])
+    #direction = np.where(zscore >= cutoff, 1, direction)
+    #direction = np.where(zscore <= -cutoff, -1, direction)
+    direction = np.where((zscore>0) & (myzscore == 1), 1, direction)
+    direction = np.where((zscore<0) & (myzscore == 1), -1, direction)
 
-        stats['residuals'] = pd.DataFrame(
-            stats['residuals'], columns=self.beta.index)
-        return stats
+    #direction1 is based on the absolute zscores.
+    #direction1 = np.zeros(DMseg_stats.shape[0])
+    #direction1 = np.where(abs(zscore) >= cutoff, 1, direction)
+    direction1 = myzscore
+    
 
-    def create_rovcluster(self):
-        # clusters with len > 1
-        clustersd_groupby = self.clustersd.groupby(self.clustersd)
-        ROVcluster = clustersd_groupby.filter(lambda x: len(x) > 1)
-        return ROVcluster
+    #segments are segments based on direction1 (a segment includes all connected CpGs with different direction); a segment can cross the border of a cluster
+    tmp0 = 1*(np.diff(direction1) != 0)
+    tmp0 = np.insert(tmp0, 0, 1)
+    segments = np.cumsum(tmp0)
 
-    def create_roicluster(self):
-        ROVcluster_groupby = self.ROVcluster.groupby(self.ROVcluster)
-        mycoef = self.stats["statistics"]['coef']
-        myzscore = self.stats["statistics"]['zscore']
-        ROIcluster = ROVcluster_groupby.filter(lambda x: (mycoef[x.index].abs().max(
-        ) > self.beta_diff_cutoff and myzscore[x.index].abs().max() > self.zscore_cutoff))
-        return ROIcluster
+    #split a segment if it covers multiple clusters; a segment should be within a cluster
+    allsegments = segments + DMseg_stats['cluster']
+    tmp0 = 1*(np.diff(allsegments) != 0)
+    tmp0 = np.insert(tmp0, 0, 1)
+    allsegments = np.cumsum(tmp0)
 
-    def evaluate_segments_all(self, simulation):
-        if not simulation:
-            DMseg_sd = self.stats["statistics"]['sd'][self.ROIcluster.index]
-            DMseg_coef = self.stats["statistics"]['coef'][self.ROIcluster.index]
-            DMseg_pos = self.pos[self.ROIcluster.index]
-            DMseg_chr = self.chr[self.ROIcluster.index]
-            DMseg_stats = pd.DataFrame({'coef': DMseg_coef,
-                                        'sd': DMseg_sd,
-                                        'chr': DMseg_chr,
-                                        'pos': DMseg_pos,
-                                        'cluster': self.ROIcluster},
-                                       columns=["coef", "sd", "chr", "pos", "cluster"])
-            DMseg_stats = DMseg_stats.groupby(by="cluster")
-            # find a case to debug
-            # DMseg_stats_groupby = DMseg_stats.groupby(by = "cluster")
-            # tmp = DMseg_stats_groupby.groups
-            # DMseg_stats_groupby_len = [len(tmp[x]) for x in DMseg_stats_groupby.groups.keys()]
-            # DMseg_stats_groupby_len.index(97)
-            # list(DMseg_stats_groupby.groups.keys())[6295]
-            # bstats = DMseg_stats.loc[DMseg_stats_groupby.groups[60991]]
+    #allsegments are the final segments
+    DMseg_stats['segment'] = allsegments
+    DMseg_stats['direction'] = direction
+    #segment1 are based on direction (consider signs)
+    tmp0 = 1*(np.diff(direction) != 0)
+    tmp0 = np.insert(tmp0, 0, 1)
+    segments1 = np.cumsum(tmp0)
+    allsegments1 = segments1 + DMseg_stats['cluster']
+    tmp0 = 1*(np.diff(allsegments1) != 0)
+    tmp0 = np.insert(tmp0, 0, 1)
+    allsegments1 = np.cumsum(tmp0)
+    DMseg_stats['segment1'] = allsegments1
 
-            cluster_index = []
-            cluster_L = []
-            cluster_probes = []
-            cluster_chr = []
-            cluster_pos = []
-            segment_L = []
-            segment_probes = []
-            segment_LRT = []
-            segment_mean = []
-            for keys, bstats in DMseg_stats:
-                bdiff = bstats['coef']
-                sd = bstats['sd']
-                bvar = np.diag(np.linalg.inv(np.diag(sd*sd)))
-                bvar = pd.Series(bvar, index=bdiff.index)
-                mychar = bstats['chr'][0]
-                mypos = bstats['pos'].astype(int)
-                DM_segments_tmp1 = get_segments(bdiff, sd, bvar, cutoff=1.96)
-                cluster_tmp = bstats['cluster'][0]
-                if DM_segments_tmp1 is not None:
-                    probe_names = bdiff.index.to_list()
-                    for i in range(len(DM_segments_tmp1)):
-                        idx1 = DM_segments_tmp1['start'][i]
-                        idx2 = DM_segments_tmp1['end'][i]
-                        cluster_index.append(cluster_tmp)
-                        cluster_L.append(len(probe_names))
-                        cluster_probes.append(";".join(str(v)
-                                              for v in probe_names))
-                        cluster_chr.append(mychar)
-                        cluster_pos.append(";".join(str(v) for v in mypos))
-                        segment_L.append(idx2-idx1+1)
-                        segment_LRT.append(DM_segments_tmp1['LRT'][i])
-                        segment_mean.append(DM_segments_tmp1['seg_mean'][i])
-                        segment_probes.append(";".join(str(v)
-                                              for v in probe_names[idx1:(idx2+1)]))
-            DMseg_segments = dict(cluster_index=cluster_index, cluster_L=cluster_L, cluster_probes=cluster_probes,
-                                  cluster_chr=cluster_chr, cluster_pos=cluster_pos, segment_L=segment_L, segment_probes=segment_probes,
-                                  segment_LRT=segment_LRT, segment_mean=segment_mean)
-            # DMseg_segments = pd.DataFrame(data = DMseg_segments)
+    return DMseg_stats
+    
 
-            # DMseg_segments.to_csv("//center/fh/fast/dai_j/Programs/DMseg1/DMseg/R/DMseg_segments_EAC_BE.csv")
+#LRT function considering switches in a peak
+def LRT_segment_nocorr(DMseg_stats):
+    csegments = DMseg_stats.segment
+    bdiff = np.abs(DMseg_stats.Coef)
+    bvar= 1/pow(DMseg_stats.SE,2)
+    DMseg_stats["bvar"] = bvar
+    DMseg_stats['bdiff_bvar'] = bvar * bdiff
+    #first compute b0,b1 based on segments using zscore (not absolute values)
+    tmp = DMseg_stats.groupby(by="segment1")
+    b0 = tmp['bvar'].sum()
+    b1 = tmp["bdiff_bvar"].sum()
+    sign = tmp['direction'].first()
+    #the segment id using absolute zscore
+    mysegment = tmp['segment'].first()
+    #include the sign here
+    tmp1 = pd.DataFrame({"b0":b0,"b1_sign":b1*sign,"bb1_divid_bb0_sign":b1/b0*sign,"segment":mysegment},index=b0.index)
+    tmp1_groupby = tmp1.groupby(by="segment")
+    bb0 = tmp1_groupby['b0'].sum()
+    bb1 = tmp1_groupby['b1_sign'].sum()
+    seg_mean = bb1/bb0
+    tmp1["bb1_divid_bb0_sign"] = round(tmp1["bb1_divid_bb0_sign"],3)
+    tmp1["bb1_divid_bb0_sign"] = tmp1["bb1_divid_bb0_sign"].astype(str)
+    tmp1_groupby = tmp1.groupby(by="segment")
+    #for segmean if there are swiches, show all
+    seg_mean_all = tmp1_groupby.agg({"bb1_divid_bb0_sign": ";".join})
+ 
+    groupcounts= csegments.groupby(csegments).count()
+    seg_mean_vec = np.repeat(seg_mean,groupcounts)
+    ## I corrected an error here, previous code is  lrt1=pow(bdiff-seg_mean_vec,2)*bvar
+    ## bdiff has been taken to absolute value, need original scale for LRT calculation, this does not matter to lrt0
+    lrt1=pow(DMseg_stats.Coef.to_numpy()-seg_mean_vec.to_numpy(),2)*bvar
+    lrt0=pow(bdiff,2)*bvar
+    lrt= lrt0.groupby(csegments).sum() - lrt1.groupby(csegments).sum()
+    result = dict(lrt=lrt, seg_mean=seg_mean_all)
+    return result
+
+#wrap Search_segments + LRT
+def Segment_satistics(Pstats1,clusterindex,pos,chr,diff_cutoff,zscore_cutoff=1.96,zscore_cutoff1=1.78):
+    # Check ROI, region of interest, both: coef.cutoff, zsocre.cutoff ---------
+    # clusters meet beta_diff_cutoff and zscore_cutoff
+
+    Pstats1 = pd.DataFrame(Pstats1,index=clusterindex.index,columns=["Coef","SE"])
+    Pstats1["Zscore"] = Pstats1["Coef"]/Pstats1["SE"]
+    mycoef = 1*(Pstats1['Coef'].abs()>diff_cutoff)
+    myzscore = 1*(Pstats1['Zscore'].abs()>zscore_cutoff)
+    # myzscore1 = 1*(Pstats1['Zscore'].abs()>zscore_cutoff1)
+    # myzscore2 = myzscore*2 + myzscore1
+    # tmp = myzscore2.to_string(index=False)
+    # tmp = re.sub("\n",'',tmp)
+    # if myzscore.index.name is not None:
+    #     tmp = re.sub(myzscore.index.name,'',tmp)
+    # tmp = re.sub(" ",'',tmp)
+    # #the index where a cpg in the middle has a weak signal (Z-score>zscore_cutoff1)
+    # tmp1 = [_.start() for _ in re.finditer("313",tmp)]
+    # if (len(tmp1)>0):
+    #     myzscore.iloc[np.array(tmp1)+1]=1
+    
+    # tmp3 =myzscore.to_frame()
+    # tmp3['index']=range(myzscore.shape[0])
+    # tmp3['clusterindex']=clusterindex
+    
+    # tmp = myzscore.to_string(index=False)
+    # tmp = re.sub("\n",'',tmp)
+    # if myzscore.index.name is not None:
+    #     tmp = re.sub(myzscore.index.name,'',tmp)
+    # tmp1 = tmp3.groupby(clusterindex).index.first().to_list()
+    # tmp2 = tmp3.groupby(clusterindex).index.last().to_list()
+    # tmp2 = [j+1 for j in tmp2]
+    # tmp4 =["11" in tmp[tmp1[j]:tmp2[j]] for j in range(len(tmp1))]
+
+    coef_select=mycoef.groupby(clusterindex).sum()>1
+    zscore_select=myzscore.groupby(clusterindex).sum()>1
+    #zscore_select = tmp4
+
+    groupcounts = clusterindex.groupby(clusterindex).count()
+    coef_select_vec = np.repeat(coef_select, groupcounts)
+    zscore_select_vec = np.repeat(zscore_select, groupcounts)
+    ROIcluster=clusterindex[clusterindex.index[np.logical_and(coef_select_vec,zscore_select_vec)]]
+    if len(ROIcluster) == 0:
+        #print("No ROI been found, please consider to reduce the value of diff_cutoff")
+        DMseg_out = pd.DataFrame(columns=["cluster","cluster_L","chr","start_cpg","start_pos","end_cpg","end_pos","n_cpgs","seg_mean","LRT"])
+    else:
+        DMseg_sd = Pstats1['SE'].loc[ROIcluster.index]
+        DMseg_coef = Pstats1['Coef'].loc[ROIcluster.index]
+   
+        DMseg_pos = pos[ROIcluster.index]
+        DMseg_chr = chr[ROIcluster.index]
+    
+        DMseg_stats = pd.concat([DMseg_coef, DMseg_sd, DMseg_chr, DMseg_pos, ROIcluster], axis=1)
+        DMseg_stats.columns = ["Coef", "SE", "chr", "pos", "cluster"]
+
+        DMseg_stats = Search_segments(DMseg_stats,zscore_cutoff,zscore_cutoff1)
+    
+        DMseg_clusterlen = DMseg_stats.groupby(by="cluster")['Coef'].count()
+        #peaks
+        DMseg_stats1 = DMseg_stats[DMseg_stats.segment *DMseg_stats.direction != 0]
+        DMseg_stats1_groupby = DMseg_stats1.groupby(by="segment")
+        # #peak should have #cpg>1
+        tmp = DMseg_stats1_groupby['cluster'].transform('count').gt(1)
+        DMseg_stats1 = DMseg_stats1.loc[tmp.index[tmp==True]]
+
+        ## compute the LRT statistics
+
+        tmp = LRT_segment_nocorr(DMseg_stats=DMseg_stats1)
+        #segid = np.unique(DMseg_stats1.segment)
+
+        DMseg_out = pd.DataFrame(columns=["cluster","cluster_L","chr","start_cpg","start_pos","end_cpg","end_pos","n_cpgs","seg_mean","LRT"],index=tmp['seg_mean'].index)
+        #if (len(np.shape(tmp['seg_mean']))==2):
+        #    DMseg_out["seg_mean"]=tmp['seg_mean'].squeeze()
+        #else:
+        DMseg_out["seg_mean"] = tmp['seg_mean']
+        DMseg_out["LRT"]=tmp['lrt']
+
+        DMseg_stats1["cpgname"] = DMseg_stats1.index
+        DMgroup = DMseg_stats1.groupby("segment")
+        DMseg_out["cluster"] = DMgroup["cluster"].first()
+        DMseg_out["cluster_L"] = DMseg_clusterlen.loc[DMseg_out["cluster"]].to_list()
+        DMseg_out["n_cpgs"]=DMgroup["segment"].count()
+        DMseg_out["chr"]=DMgroup["chr"].first()
+        DMseg_out["start_cpg"]=DMgroup["cpgname"].first()
+        DMseg_out["end_cpg"]=DMgroup["cpgname"].last()
+        DMseg_out["start_pos"] = DMgroup["pos"].first()
+        DMseg_out["start_pos"] = DMseg_out["start_pos"].astype(int)
+        DMseg_out["end_pos"] = DMgroup["pos"].last()
+        DMseg_out["end_pos"] = DMseg_out["end_pos"].astype(int)
+        #DMseg_out["numswitches"] = DMgroup["segment1"].last()-DMgroup["segment1"].first()
+        DMseg_out = DMseg_out.reset_index(drop=True)
+    return DMseg_out
+
+
+# fit model for permutation, sequential
+def fit_model_probes_sim(beta,design,seed,B):
+    
+    beta1 = np.array(beta)
+    design1 = np.array(design)
+    M = np.delete(design1,1,axis=1)
+    M_QR_q, M_QR_r = np.linalg.qr(M)
+    S = np.diag([1] * M.shape[0]) - np.matmul(M_QR_q, M_QR_q.transpose())
+    V = design1[:, 1]
+    SV = np.matmul(S, V)
+
+    QR_X_q, QR_X_r = np.linalg.qr(design)
+    resids0 = np.diag([1] * design.shape[0]) - np.matmul(QR_X_q, QR_X_q.transpose())
+    tmp1 = np.linalg.inv(design1.T.dot(design1))[1, 1] / (beta.shape[1] - np.linalg.matrix_rank(M) - 1)
+
+    coef = np.zeros((beta.shape[0],B))
+    allSE = np.zeros((beta.shape[0],B))
+
+    for i in range(B):
+        np.random.seed(seed+i)
+        idx = np.random.permutation(range(beta.shape[1]))
+        mybeta = beta1[:,idx]
+        coef[:,i] = np.matmul(mybeta, np.matmul(S.transpose(), V)) / np.matmul(V.transpose(), SV)
+        resids = np.matmul(resids0, mybeta.transpose())
+        allSE[:,i] = np.sqrt(np.multiply(resids, resids).sum(axis=0) * tmp1)
+
+    result = np.concatenate((coef,allSE),axis=1)
+    return result
+
+#permutation, sequential version
+def do_simulation1serial(beta,design,clusterindex,pos,chr,seed,diff_cutoff,zscore_cutoff,zscore_cutoff1,B):
+
+    print("Start " + str(B) + " permutation: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    allsimulation=pd.DataFrame()
+    beta1 = np.array(beta)
+    design1 = np.array(design)
+    #print("Start linear model fitting: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    Pstatsall =  fit_model_probes_sim(beta=beta1,design=design1,seed=seed,B=B)
+    #strftime("%Y-%m-%d %H:%M:%S", localtime())
+    #print("Start peak finding and LRT computing: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    for i in range(B):
+        if (i+1) % 500 == 0:
+            print("Iteration " + str(i+1) + ":  " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+
+        Pstats2 = np.array((Pstatsall[:,i],Pstatsall[:,i+B])).T
+        DMseg_out1 = Segment_satistics(Pstats1=Pstats2,clusterindex=clusterindex,pos=pos,chr=chr,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1)
+        DMseg_out1['simulationidx'] = i
+        DMseg_out2 = DMseg_out1.loc[:,["cluster","cluster_L","LRT","simulationidx"]]
+        allsimulation= pd.concat([allsimulation, DMseg_out2])
+    
+    print("Permutation ends: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    return allsimulation
+
+#permuation, parallel version
+def fit_model_probes_sim0(i,beta1,S,V,SV,resids0,term,seed,B,ncore):
+    n=int(B/ncore)+1
+    seq = list(range(n*i,(i+1)*n))
+    if i == ncore-1:
+        seq =list(range(n*i,B))
+    allresult = np.empty((len(seq)*2,beta1.shape[0]))
+    k=0
+    for j in seq:
+        np.random.seed(seed+j)
+        idx = np.random.permutation(range(beta1.shape[1]))
+        mybeta = beta1[:,idx]
+        coef = np.matmul(mybeta, np.matmul(S.transpose(), V)) / np.matmul(V.transpose(), SV)
+        resids = np.matmul(resids0, mybeta.transpose())
+        SE = np.sqrt(np.multiply(resids, resids).sum(axis=0) * term)
+        result = np.vstack([coef,SE])
+        allresult[(k*2):(k*2+2)] = result #np.vstack([allresult,result]) 
+        k = k+1
+    return(allresult)
+
+def fit_model_probes_sim_all(beta,design,seed,B,ncore):
+    
+    beta1 = np.array(beta)
+    design1 = np.array(design)
+    M = np.delete(design1,1,axis=1)
+    M_QR_q, M_QR_r = np.linalg.qr(M)
+    S = np.diag([1] * M.shape[0]) - np.matmul(M_QR_q, M_QR_q.transpose())
+    V = design1[:, 1]
+    SV = np.matmul(S, V)
+
+    QR_X_q, QR_X_r = np.linalg.qr(design)
+    resids0 = np.diag([1] * design.shape[0]) - np.matmul(QR_X_q, QR_X_q.transpose())
+    term = np.linalg.inv(design1.T.dot(design1))[1, 1] / (beta.shape[1] - np.linalg.matrix_rank(M) - 1)
+
+    allcoef = np.zeros((beta.shape[0],B))
+    allSE = np.zeros((beta.shape[0],B))
+
+    pool = mp.Pool(ncore)
+
+    start = time.time()
+    #results = [pool.apply(fit_model_probes_sim0, args=(ii, beta1,S,V,SV,resids0,term,seed)) for ii in range(B)]
+    #results = [pool.starmap(fit_model_probes_sim0, [(ii, beta1,S,V,SV,resids0,term,seed) for ii in range(B)])]
+    #result_objects = [pool.apply_async(fit_model_probes_sim0, args=(ii, beta1,S,V,SV,resids0,term,seed)) for ii in range(B)]
+    #results = [r.get()[1] for r in result_objects]
+    #results = pool.starmap_async(fit_model_probes_sim00, [(ii, beta1,S,V,SV,resids0,term,seed) for ii in range(B)]).get()
+
+    results = pool.starmap_async(fit_model_probes_sim0, [(ii, beta1,S,V,SV,resids0,term,seed,B,ncore) for ii in range(ncore)]).get()
+    end = time.time()
+    #print(end-start)
+    pool.close()
+    pool.join()
+    k=0
+    for i in range(ncore):
+        m = results[i].shape[0]
+        allcoef[:,k:(k+int(m/2))] = results[i][range(0,m,2),:].T
+        allSE[:,k:(k+int(m/2))] = results[i][range(1,m,2),:].T
+        k=k+int(m/2)
+
+    result = np.concatenate((allcoef,allSE),axis=1)
+    return result
+
+def Segment_satistics0(i,Pstatsall,clusterindex,pos,chr,diff_cutoff,zscore_cutoff,zscore_cutoff1,B,ncore):
+    n=int(B/ncore)+1
+    seq = list(range(n*i,(i+1)*n))
+    if i == ncore-1:
+        seq =list(range(n*i,B))
+    allresult = np.empty((0,4))
+    k = 0
+    for j in seq:
+        Pstats2 = np.array((Pstatsall[:,j],Pstatsall[:,j+B])).T
+        DMseg_out1 = Segment_satistics(Pstats1=Pstats2,clusterindex=clusterindex,pos=pos,chr=chr,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1)
+        DMseg_out1['simulationidx'] = j
+        DMseg_out2 = DMseg_out1.loc[:,["cluster","cluster_L","LRT","simulationidx"]]
+        allresult = np.vstack([allresult, DMseg_out2])
+    return allresult
+
+def do_simulation1(beta,design,clusterindex,pos,chr,seed,diff_cutoff,zscore_cutoff,zscore_cutoff1,B,ncore):
+
+    print("Start " + str(B) + " permutation: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+
+    #print("Start linear model fitting: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    #Pstatsall =  fit_model_probes_sim(beta=beta1,design=design1,seed=seed,B=B)
+    Pstatsall = fit_model_probes_sim_all(beta,design,seed,B,ncore)
+    #strftime("%Y-%m-%d %H:%M:%S", localtime())
+    #print("Start peak finding and LRT computing: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+
+    pool = mp.Pool(ncore)
+    start = time.time()
+    #results = [pool.starmap(Segment_satistics0, [(ii, Pstatsall,clusterindex,pos,chr,diff_cutoff,zscore_cutoff,zscore_cutoff1,B) for ii in range(B)])]
+    #results = pool.starmap_async(Segment_satistics00, [(ii, Pstatsall,clusterindex,pos,chr,diff_cutoff,zscore_cutoff,zscore_cutoff1,B) for ii in range(B)]).get()
+    results = pool.starmap_async(Segment_satistics0, [(ii, Pstatsall,clusterindex,pos,chr,diff_cutoff,zscore_cutoff,zscore_cutoff1,B,ncore) for ii in range(ncore)]).get()
+    end = time.time()
+    #print(end-start)
+    pool.close()
+    pool.join()
+    allsimulation=pd.DataFrame()
+    for i in range(ncore):
+        allsimulation = pd.concat([allsimulation, pd.DataFrame(results[i])])
+    
+    allsimulation.columns = ["cluster","cluster_L","LRT","simulationidx"]
+    print("Permutation ends: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
+    return allsimulation
+
+#get FWER based on NULL without stratification
+def compute_fwer1(DMseg_out,allsimulation,B,clusterindex,L1=0,L2=10):
+    DMseg_out1 = DMseg_out[(DMseg_out['cluster_L']>L1) & (DMseg_out['cluster_L']<=L2)]
+    LRT_alt = DMseg_out1['LRT']
+    allsimulation1 = allsimulation[(allsimulation['cluster_L']>L1) & (allsimulation['cluster_L']<=L2)]
+    allsimulation1_grp = allsimulation1.groupby(by="simulationidx")
+
+    #p-value
+    LRT_alt_rank1 = pd.DataFrame(-np.array(LRT_alt.to_list() + allsimulation1['LRT'].to_list()))
+    LRT_alt_rank1 = LRT_alt_rank1.rank(axis=0, method='max')[
+        0:len(LRT_alt)]
+    LRT_alt_rank1 = LRT_alt_rank1 - LRT_alt_rank1.rank(axis=0, method='max')
+    
+    #multiple peaks can be found in a cluster, which increase the total number of test
+    multiplepeaksinacluster = allsimulation1_grp['cluster'].value_counts().tolist()
+    #if one peak found in a cluster, no need to add the number 
+    multiplepeaksinacluster = [x-1 for x in multiplepeaksinacluster]
+    clusterlen = clusterindex.groupby(clusterindex).count()
+    #total number of clusters in stratified data
+    numclusters = sum((clusterlen >L1) & (clusterlen <= L2))
+    totaltests = numclusters*B + (sum(multiplepeaksinacluster))
+
+    P = LRT_alt_rank1 / totaltests
+    P.index=DMseg_out1.index.to_list()
+    P.columns=["P"]
+    #DMseg_out1 = DMseg_out1.assign(P = P)
+    DMseg_out1 = pd.concat([DMseg_out1,P],axis=1)
+    #DMseg_out1["P"] = round(DMseg_out1["P"],3)
+
+    #FWER
+    LRTmax = allsimulation1_grp['LRT'].max().tolist()
+    if len(LRTmax) < B:
+        LRTmax.extend([0]*(B - len(LRTmax)))
+
+    LRT_alt_rank = pd.DataFrame(-np.array(LRT_alt.to_list() + LRTmax))
+    LRT_alt_rank = LRT_alt_rank.rank(axis=0, method='max')[
+        0:len(LRT_alt)]
+    LRT_alt_rank = LRT_alt_rank - LRT_alt_rank.rank(axis=0, method='max')
+
+    FWER = LRT_alt_rank / len(LRTmax)
+    FWER.index = DMseg_out1.index.to_list()
+    FWER.columns = ["FWER"]
+    DMseg_out1 = pd.concat([DMseg_out1,FWER],axis=1)
+    #DMseg_out1 = DMseg_out1.assign(FWER = FWER)#.iloc[:,0].to_list()
+    #DMseg_out1["LRT"] = round(DMseg_out1["LRT"],3)
+
+    DMseg_out1 = DMseg_out1.sort_values(by=['LRT'], ascending=False)
+    #DMseg_out1 = DMseg_out1.reset_index(drop=True) 
+    np.sum(DMseg_out1["FWER"]<0.05)
+    idx = np.where(DMseg_out1["FWER"]<0.05)[0]
+    print(len(idx))
+    #print(DMseg_out1.iloc[idx,:])
+    return DMseg_out1
+
+#get all the FWER, FWER based on NULL without stratification
+def compute_fwerall(DMseg_out,allsimulation,B,clusterindex,Ls=[0,10,20,30]):
+    DMseg_out2 = pd.DataFrame()
+    for i in range(len(Ls)):
+        if i < (len(Ls)-1):
+            L1 = Ls[i]
+            L2 =Ls[i+1]
         else:
-            DMseg_sd = self.stats["statistics"]['sd'][self.ROVcluster.index]
-            fit_x = self.stats['fit_x']
-            solve_coef = np.linalg.inv(fit_x.T.dot(fit_x))[1, 1]
-            DMseg_residuals = self.stats["residuals"].loc[:,
-                                                          self.ROVcluster.index]
-            DMseg_stats1 = pd.concat(
-                [DMseg_sd, DMseg_residuals.T, self.ROVcluster], axis=1)
-            #DMseg_stats1 = DMseg_stats1.iloc[:5000, :]
-            DMseg_stats_names = DMseg_residuals.index.to_list()
-            DMseg_stats_names.insert(0, 'sd')
-            DMseg_stats_names.insert(len(DMseg_stats_names), 'cluster')
-            DMseg_stats1.columns = DMseg_stats_names
-            # DMseg_stats1.cluster.astype(int)
-            DMseg_stats1_groupby = DMseg_stats1.groupby(by="cluster")
-            # find a case (with 97 CpGs) to debug
-            # tmp = DMseg_stats1_groupby.groups
-            # DMseg_stats1_groupby_len = [len(tmp[x]) for x in DMseg_stats1_groupby.groups.keys()]
-            # DMseg_stats1_groupby_len.index(97) #a segment with 97 CpGs
-            # tmp1 = list(tmp.keys())[15227] #60991
-            # bstats = DMseg_stats1.loc[DMseg_stats1_groupby.groups[60991]]
+            L1 = Ls[i]
+            L2 = max(allsimulation['cluster_L'])
+        DMseg_out1 = compute_fwer1(DMseg_out,allsimulation,B,clusterindex,L1,L2)
+        DMseg_out2 = pd.concat([DMseg_out2,DMseg_out1])
+    DMseg_out2 = DMseg_out2.sort_values(by=['FWER',"n_cpgs"], ascending=[True,False])
+    return(DMseg_out2)
 
-            # version to use apply, not efficient
-            # allres = DMseg_stats1.groupby('cluster').apply(outloop, solve_coef=solve_coef, B=B)
-            # tmp = allres.to_list()
-            # LRT = [tmp[x]['LRT'] for x in range(len(tmp)) if tmp[x]['LRT'] is not None]
-            # LRT = [item for sublist in LRT for item in sublist]
-            # maxLRT = [tmp[x]['maxLRT'] for x in range(len(tmp))]
 
-            LRT = []
-            maxLRT = []
-            for _, bstats in DMseg_stats1_groupby:
-                # print(_)
-                sd = bstats['sd']
-                bvar = np.diag(np.linalg.inv(np.diag(sd*sd)))
-                bvar = pd.Series(bvar, index=sd.index)
-                mat_tmp = bstats.loc[:, DMseg_residuals.index].T
-                cmat = solve_coef * mat_tmp.cov()
-                np.random.seed(self.seed)
-                mean_sim = np.repeat(0, len(sd))
-                coef_sim = np.random.multivariate_normal(
-                    mean=mean_sim, cov=cmat, size=self.B)
-                coef_sim = pd.DataFrame(coef_sim, columns=sd.index)
+#get p-values in stratified clusters
+#get p-values based on a single stratified set of NULL, for short clusters
+def compute_pvalue_short(DMseg_out,allsimulation,B,clusterwidth,L1=0,L2=10):
+    shortclusters1 = clusterwidth.index[(clusterwidth>L1) & (clusterwidth<=L2)]
+    shortclusters1 = shortclusters1.to_list()
+    DMseg_out_short = DMseg_out[(DMseg_out['cluster_L']>L1) & (DMseg_out['cluster_L']<=L2) ]
+    LRT_alt_short = DMseg_out_short['LRT']
+    allsimulation_short = allsimulation[(allsimulation['cluster_L']>L1) &(allsimulation['cluster_L']<=L2)]
+    allsimulation_short['LRT'].describe()
+    allsimulation_short_grp = allsimulation_short.groupby(by="simulationidx")
+    # tmp=plt.hist(allsimulation_short['LRT'])
+    # plt.xlabel("LRT")
+    # plt.show()
+    
+    #p-value of observed,number of Null have larger LRT than observed LRT
+    LRT_alt_rank_short = pd.DataFrame(-np.array(LRT_alt_short.to_list() + allsimulation_short['LRT'].to_list()))
+    LRT_alt_rank_short = LRT_alt_rank_short.rank(axis=0, method='max')[0:len(LRT_alt_short)]
+    LRT_alt_rank_short = LRT_alt_rank_short - LRT_alt_rank_short.rank(axis=0, method='max')
+    
+    #multiple peaks can be found in a cluster, which increase the total number of test
+    multiplepeaksinacluster_short = allsimulation_short_grp['cluster'].value_counts().tolist()
+    #if one peak found in a cluster, no need to add the number in addition to total cluster numbers 
+    multiplepeaksinacluster_short = [x-1 for x in multiplepeaksinacluster_short]
+    #total number of clusters in stratified data
+    numclusters_short = len(shortclusters1)
+    #the second part is for extra peaks found in a clusters
+    totaltests_short = numclusters_short*B + sum(multiplepeaksinacluster_short)
+    #print(totaltests_short)
+    
+    P_short = LRT_alt_rank_short / totaltests_short
+    P_short.index=DMseg_out_short.index.to_list()
+    P_short.columns=["P"]
+    # tmp=plt.hist(P_short)
+    # plt.xlabel("p-value")
+    # tmp=plt.hist(-np.log10(P_short['P']))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    
+    #p-value of null DMRs
+    NULL_rank_short = pd.DataFrame(-np.array(allsimulation_short['LRT'].to_list()))
+    NULL_rank_short = NULL_rank_short.rank(axis=0, method='max')
+    NULL_P_short = NULL_rank_short/totaltests_short
+    NULL_P_short.index = allsimulation_short.index
+    # NULL_P_short.describe()
+    # tmp = [1]*(totaltests_short-len(NULL_P_short))
+    # tmp1 = NULL_P_short.iloc[:,0].to_list()
+    # tmp2 = tmp +tmp1
+    # np.quantile(tmp2,[0,0.005,0.01,0.015,0.1,1])
+    # tmp=plt.hist(tmp2)
+    # plt.xlabel("p-value")
+    # tmp=plt.hist(-np.log10(NULL_P_short))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    allsimulation_short = allsimulation_short.assign(null_p=NULL_P_short.iloc[:,0].to_list())
+    result = dict(P_short=P_short,allsimulation_short=allsimulation_short)
+    return result
 
-                # find segments pass filters
-                Index_picked = np.where((coef_sim.abs().max(axis=1) > self.beta_diff_cutoff) * (
-                    coef_sim.div(sd).abs().max(axis=1) > self.zscore_cutoff))
-                coef_sim1 = coef_sim.loc[Index_picked]
-                #DMseg_segments_tmp2={"lrtmax": pd.Series([None]*B), "lrt": None}
-                DMseg_segments_tmp2 = get_segmentsall(
-                    bdiff1=coef_sim1, sd=sd, bvar=bvar, cutoff=1.96, B=self.B)
-                LRT.append(DMseg_segments_tmp2['lrt'])
-                maxLRT.append(DMseg_segments_tmp2['lrtmax'])
-            DMseg_segments = dict(LRT=LRT, maxLRT=maxLRT)
-            # DMseg_segments2.to_csv("//center/fh/fast/dai_j/Programs/DMseg1/DMseg/R/DMseg_segments_EAC_BE_null.csv")
-        return DMseg_segments
+#get p values for long clusters
+def compute_pvalue_long(DMseg_out,allsimulation,allsimulation2,B,B1,longclusters):
+    DMseg_out_long = DMseg_out[DMseg_out['cluster'].isin(longclusters)]
+    LRT_alt_long = DMseg_out_long['LRT']
+    
+    #simulation in first 500
+    allsimulation_long500 = allsimulation[(allsimulation['cluster'].isin(longclusters))]
+    #extra simulation for long clusters
+    if allsimulation2['simulationidx'].min() < B:
+        allsimulation2['simulationidx'] = allsimulation2['simulationidx'] + B
+    #simulation in all 5000
+    allsimulation_long = pd.concat([allsimulation_long500,allsimulation2])
+    allsimulation_long_grp = allsimulation_long.groupby(by="simulationidx")
+    # tmp=plt.hist(allsimulation_long['LRT'])
+    # plt.xlabel("LRT")
+    # plt.show()
+    # tmp=plt.hist(allsimulation_long500['LRT'])
+    # plt.xlabel("LRT")
+    # plt.show()
+    
+    #p-value of observed
+    LRT_alt_rank_long = pd.DataFrame(-np.array(LRT_alt_long.to_list() + allsimulation_long['LRT'].to_list()))
+    LRT_alt_rank_long = LRT_alt_rank_long.rank(axis=0, method='max')[0:len(LRT_alt_long)]
+    LRT_alt_rank_long = LRT_alt_rank_long - LRT_alt_rank_long.rank(axis=0, method='max')
+    
+    #multiple peaks can be found in a cluster, which increase the total number of test
+    multiplepeaksinacluster_long = allsimulation_long_grp['cluster'].value_counts().tolist()
+    #if one peak found in a cluster, no need to add the number 
+    multiplepeaksinacluster_long = [x-1 for x in multiplepeaksinacluster_long]
+    #total number of clusters in stratified data
+    numclusters_long = len(longclusters)
+    totaltests_long = numclusters_long*(B+B1) + sum(multiplepeaksinacluster_long)
+    #print(totaltests_long)
+    
+    P_long = LRT_alt_rank_long / totaltests_long
+    P_long.index=DMseg_out_long.index.to_list()
+    P_long.columns=["P"]
+    
+    # tmp=plt.hist(P_long)
+    # plt.xlabel("p-value")
+    # tmp=plt.hist(-np.log10(P_long['P']))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    
+    #p-value of NULL DMRs in first 500 simulation
+    allsimulation_long['LRT'].describe()
+    NULL_rank_long500 = pd.DataFrame(-np.array(allsimulation_long['LRT'].to_list()))
+    #NULL_rank_long500 = pd.DataFrame(-np.array(allsimulation_long500['LRT'].to_list() + allsimulation_long['LRT'].to_list()))
+    NULL_rank_long500 = NULL_rank_long500.rank(axis=0, method='max')[0:len(allsimulation_long500)]
+    #NULL_rank_long500 = NULL_rank_long500 - NULL_rank_long500.rank(axis=0)    
+    NULL_P_long500 = NULL_rank_long500/totaltests_long
+    NULL_P_long500.index = allsimulation_long500.index
+    NULL_P_long500.describe()
+    # tmp = [1]*(totaltests_long-len(NULL_P_long500))
+    # tmp1 = NULL_P_long500.iloc[:,0].to_list()
+    # tmp2 = tmp +tmp1
+    # np.quantile(tmp2,[0,0.005,0.01,0.015,0.1,1])
+    # tmp=plt.hist(NULL_P_long500)
+    # plt.xlabel("p-value")
+    # tmp=plt.hist(-np.log10(NULL_P_long500))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    allsimulation_long500 = allsimulation_long500.assign(null_p=NULL_P_long500.iloc[:,0].to_list())
+    result = dict(P_long=P_long,allsimulation_long500=allsimulation_long500)
+    return result
 
-    def compute_segment_p_value(self):
-        LRT_alt = self.segments_alt['segment_LRT']
-        LRT_alt = pd.Series(LRT_alt)
-        LRT_null = self.segments_null['LRT']
-        LRT_max = self.segments_null['maxLRT']
+#to run 2 category case, set Ls=[0,20], the last level is for long clusters
+def compute_fwer_all (DMseg_out,allsimulation,allsimulation2,B,B1,longclusters,clusterwidth,Ls=[0,10,20]):
+    P = pd.DataFrame()
+    allsimulations = pd.DataFrame()
+    for i in range(len(Ls)):
+        if i < (len(Ls)-1):
+            L1 = Ls[i]
+            L2 =Ls[i+1]
+            #print(L1,L2)
+            result = compute_pvalue_short(DMseg_out,allsimulation,B,clusterwidth,L1=L1,L2=L2)
+            P = pd.concat([P,result['P_short']])
+            allsimulations = pd.concat([allsimulations,result["allsimulation_short"]])
+    result = compute_pvalue_long(DMseg_out,allsimulation,allsimulation2,B,B1,longclusters)
+    P = pd.concat([P,result['P_long']])
+    allsimulations = pd.concat([allsimulations,result["allsimulation_long500"]])
+    allsimulations_grp = allsimulations.groupby(by="simulationidx")
+    NULL_Pmin = allsimulations_grp['null_p'].min().tolist()
+    if len(NULL_Pmin) < B:
+        NULL_Pmin.extend([1]*(B - len(NULL_Pmin)))
+    #tmp = pd.DataFrame(NULL_Pmin)
+   
+    P_alt_rank = pd.DataFrame(np.array(P.iloc[:,0].to_list() + NULL_Pmin))
+    P_alt_rank = P_alt_rank.rank(axis=0, method='max')[0:len(P)]
+    P_alt_rank.index = P.index
+    P_alt_rank = P_alt_rank - P_alt_rank.rank(axis=0, method='max')
+    
+    FWER = P_alt_rank / len(NULL_Pmin)
+    FWER.columns = ["FWER"]
+    
+    DMseg_out1 = DMseg_out.assign(P=P,FWER=FWER)
+    DMseg_out1 = DMseg_out1.sort_values(by=['FWER',"n_cpgs"], ascending=[True,False])
+    #sum(DMseg_out1["FWER"]<=0.05)
+    return DMseg_out1
 
-        LRT_null_new = []
-        tmp = [item for item in LRT_null if item is not None]
-        LRT_null_new = [item for sublist in tmp for item in sublist]
-        LRT_null_new = pd.Series(LRT_null_new)
-        maxLRT_new = [
-            item_maxLRT for sublist in LRT_max for item_maxLRT in sublist]
-        maxLRT_new = pd.Series(maxLRT_new)
+#A specific case only for 2 categories: <=20 and >20,not used any more, to be deleted
+def compute_fwer_pvalue (DMseg_out,allsimulation,allsimulation2,B,B1,shortclusters,longclusters):
+    DMseg_out_short = DMseg_out[DMseg_out['cluster'].isin(shortclusters)]
+    LRT_alt_short = DMseg_out_short['LRT']
+    allsimulation_short = allsimulation[(allsimulation['cluster'].isin(shortclusters))]
+    allsimulation_short_grp = allsimulation_short.groupby(by="simulationidx")
+    # tmp=plt.hist(allsimulation1['LRT'])
+    # plt.xlabel("LRT")
+    # plt.show()
+    
+    #p-value of observed
+    LRT_alt_rank_short = pd.DataFrame(-np.array(LRT_alt_short.to_list() + allsimulation_short['LRT'].to_list()))
+    LRT_alt_rank_short = LRT_alt_rank_short.rank(axis=0, method='max')[0:len(LRT_alt_short)]
+    LRT_alt_rank_short = LRT_alt_rank_short - LRT_alt_rank_short.rank(axis=0, method='max')
+    
+    #multiple peaks can be found in a cluster, which increase the total number of test
+    multiplepeaksinacluster_short = allsimulation_short_grp['cluster'].value_counts().tolist()
+    #if one peak found in a cluster, no need to add the number 
+    multiplepeaksinacluster_short = [x-1 for x in multiplepeaksinacluster_short]
+    #total number of clusters in stratified data
+    numclusters_short = len(shortclusters)
+    totaltests_short = numclusters_short*B + sum(multiplepeaksinacluster_short)
+    
+    P_short = LRT_alt_rank_short / totaltests_short
+    P_short.index=DMseg_out_short.index.to_list()
+    P_short.columns=["P"]
+    # tmp=plt.hist(P_short)
+    # plt.xlabel("p-value")
+    # tmp=plt.hist(-np.log10(P_short['P']))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    
+    #p-value of null
+    NULL_rank_short = pd.DataFrame(-np.array(allsimulation_short['LRT'].to_list()))
+    NULL_rank_short = NULL_rank_short.rank(axis=0, method='max')[0:len(NULL_rank_short)]
+    NULL_P_short = NULL_rank_short/totaltests_short
+    NULL_P_short.index = allsimulation_short.index
+    # tmp=plt.hist(NULL_P_short)
+    # plt.xlabel("p-value")
+    
+    # tmp=plt.hist(-np.log10(NULL_P_short))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    allsimulation_short = allsimulation_short.assign(null_p=NULL_P_short.iloc[:,0].to_list())
+    
+    #for long clusters
+    DMseg_out_long = DMseg_out[DMseg_out['cluster'].isin(longclusters)]
+    LRT_alt_long = DMseg_out_long['LRT']
+    
+    #simulation in first 500
+    allsimulation_long500 = allsimulation[(allsimulation['cluster'].isin(longclusters))]
+    #extra simulation for long clusters
+    if allsimulation2['simulationidx'].min() < B:
+        allsimulation2['simulationidx'] = allsimulation2['simulationidx'] + B
+    #simulation in all 5000
+    allsimulation_long = pd.concat([allsimulation_long500,allsimulation2])
+    allsimulation_long_grp = allsimulation_long.groupby(by="simulationidx")
+    # tmp=plt.hist(allsimulation_long['LRT'])
+    # plt.xlabel("LRT")
+    # plt.show()
+    # tmp=plt.hist(allsimulation_long500['LRT'])
+    # plt.xlabel("LRT")
+    # plt.show()
+    
+    #p-value of observed
+    LRT_alt_rank_long = pd.DataFrame(-np.array(LRT_alt_long.to_list() + allsimulation_long['LRT'].to_list()))
+    LRT_alt_rank_long = LRT_alt_rank_long.rank(axis=0, method='max')[0:len(LRT_alt_long)]
+    LRT_alt_rank_long = LRT_alt_rank_long - LRT_alt_rank_long.rank(axis=0, method='max')
+    
+    #multiple peaks can be found in a cluster, which increase the total number of test
+    multiplepeaksinacluster_long = allsimulation_long_grp['cluster'].value_counts().tolist()
+    #if one peak found in a cluster, no need to add the number 
+    multiplepeaksinacluster_long = [x-1 for x in multiplepeaksinacluster_long]
+    #total number of clusters in stratified data
+    numclusters_long = len(longclusters)
+    totaltests_long = numclusters_long*(B+B1) + sum(multiplepeaksinacluster_long)
+    
+    P_long = LRT_alt_rank_long / totaltests_long
+    P_long.index=DMseg_out_long.index.to_list()
+    P_long.columns=["P"]
+    
+    # tmp=plt.hist(P_long)
+    # plt.xlabel("p-value")
+    # tmp=plt.hist(-np.log10(P_long['P']))
+    # plt.xlabel("-log10(p-value)")
+    # plt.show()
+    
+    #null p-value
+    NULL_rank_long500 = pd.DataFrame(-np.array(allsimulation_long500['LRT'].to_list() + allsimulation_long['LRT'].to_list()))
+    NULL_rank_long500 = NULL_rank_long500.rank(axis=0, method='max')[0:len(allsimulation_long500)]
+    NULL_rank_long500 = NULL_rank_long500 - NULL_rank_long500.rank(axis=0, method='max')    
+    NULL_P_long500 = NULL_rank_long500/totaltests_long
+    NULL_P_long500.index = allsimulation_long500.index
+    allsimulation_long500 = allsimulation_long500.assign(null_p=NULL_P_long500.iloc[:,0].to_list())
+    # tmp=plt.hist(NULL_P_long500)
+    # plt.xlabel("p-value")
+    # plt.savefig("/fh/fast/dai_j/Methods/DMseg/Results/test.png")
+    #allsimulation3['null_p'].min()
+    #all the nulls
+    allsimulation_null = pd.concat([allsimulation_short,allsimulation_long500])
+    allsimulation_null_grp = allsimulation_null.groupby(by="simulationidx")
+    NULL_Pmin = allsimulation_null_grp['null_p'].min().tolist()
+    if len(NULL_Pmin) < B:
+        NULL_Pmin.extend([1]*(B - len(NULL_Pmin)))
+    #tmp = pd.DataFrame(NULL_Pmin)
+    P = pd.concat([P_short,P_long])
+    P_alt_rank = pd.DataFrame(np.array(P.iloc[:,0].to_list() + NULL_Pmin))
+    P_alt_rank = P_alt_rank.rank(axis=0, method='max')[0:len(P)]
+    P_alt_rank.index = P.index
+    P_alt_rank = P_alt_rank - P_alt_rank.rank(axis=0, method='max')
+    
+    FWER = P_alt_rank / len(NULL_Pmin)
+    FWER.columns = ["FWER"]
+    
+    DMseg_out1 = DMseg_out.assign(P=P,FWER=FWER)
+    DMseg_out1 = DMseg_out1.sort_values(by=['FWER',"n_cpgs"], ascending=[True,False])
+    return DMseg_out1
 
-        LRT_alt_rank = pd.Series(-np.array(LRT_alt.append(LRT_null_new)))
-        LRT_alt_rank = LRT_alt_rank.rank(axis=0, na_option='bottom', method='max')[
-            0:len(LRT_alt)]
-        #rank in simulation
-        LRT_alt_rank = LRT_alt_rank - LRT_alt_rank.rank(axis=0)
-        # p-value is problematic, to be removed
-        p_value = LRT_alt_rank/len(LRT_null_new)
 
-        # make FDR monotone with LRT
-        LRT_ord = pd.Series(self.segments_alt['segment_LRT']).sort_values()
-        FDR = (LRT_alt_rank/self.B).divide(LRT_alt.rank(method="max", ascending=False))
-        FDR[FDR > 1] = 1
+def form_dvcdata (beta,design):
+    groups = design.iloc[:,1].unique()
+    idx1 = np.where(design.iloc[:,1]==groups[0])[0]
+    idx2 = np.where(design.iloc[:,1]==groups[1])[0]
+    Mvalue = np.log2(beta/(1-beta))
+    rmedian1 = np.median(Mvalue.iloc[:,idx1],axis=1)
+    rmedian2 = np.median(Mvalue.iloc[:,idx2],axis=1)
+    vdat = np.array(Mvalue)
+    vdat[:,idx1] = np.abs(vdat[:,idx1].T - rmedian1.T).T
+    vdat[:,idx2] = np.abs(vdat[:,idx2].T - rmedian2.T).T
+    vdat = pd.DataFrame(vdat,columns=beta.columns,index=beta.index)
+    return vdat
 
-        FDR1 = FDR.copy()
-        for j in range(1, len(FDR)):
-            FDR1[LRT_ord.index[j]] = np.min(
-                [FDR[LRT_ord.index[j]], FDR1[LRT_ord.index[j-1]]])
+#merge nearby clusters if they have high correlation in boundary CpGs.
+def merge_cluster (beta,chr,pos,cluster,maxmergegap=1000000,corr_cutoff=0.6):
+    
+    chrs = chr.unique()
+    allclusters = pd.DataFrame()
+    for mychr in chrs:
+        #print(mychr)
+        idx = np.where(chr==mychr)[0]
+        mycluster = cluster[idx]
+        mycluster = mycluster.to_frame()
+        mycluster.columns = ["cluster"]
+        mycluster['cpg'] = mycluster.index
+        mypos = pos[mycluster.index]    
+        myclustergrp = mycluster.groupby("cluster")
+        startcpgs=myclustergrp['cpg'].first().to_list()
+        endcpgs=myclustergrp['cpg'].last().to_list()
+        allmycluster = myclustergrp['cluster'].first().to_list()
+        ncpg=myclustergrp['cpg'].count()
+        ncpg.reset_index(drop=True,inplace=True)
+        endcpgs=endcpgs[:-1]
+        startcpgs=startcpgs[1:]
+        corref = pd.DataFrame({"endcpg":endcpgs,"startcpg":startcpgs,"endcluster":allmycluster[:-1],"startcluster":allmycluster[1:]})
+        corref.index = endcpgs
+        df1 = beta.loc[endcpgs].T
+        df2 = beta.loc[startcpgs].T
+        df2.columns = df1.columns
+        corref['corr'] = df1.corrwith(df2)
+        corref['distance'] = np.array(mypos[startcpgs])-np.array(mypos[endcpgs])
+        clustermerge = np.zeros(corref.shape[0])
+        clustermerge = np.where((corref['corr']>corr_cutoff) & (corref['distance']<maxmergegap), 1, clustermerge)
+        corref['clustermerge'] = clustermerge
+        if sum(clustermerge)>0:
+            tmp0 = 1*(clustermerge == 0)
+            corref["merge"]  = np.cumsum(tmp0)
+            corref1 = corref.iloc[np.where(clustermerge==1)[0]]
+            #cluster in oldcluster change to newcluster
+            corref1 = corref1.assign(oldcluster = corref1['startcluster'])
+            corref1 = corref1.assign(newcluster = corref1['endcluster'])
+            corref1_grp = corref1.groupby("merge")
+            newcluster1 = corref1_grp['endcluster'].first()
+            newcluster1 = np.repeat(newcluster1,corref1_grp["merge"].count())
+            corref1['newcluster'] = newcluster1.tolist()
+            #if mychr == 'chr22':
+            #    print(corref1)
 
-        maxLRT_new = np.array(maxLRT_new)
-        maxLRT_new = np.reshape(maxLRT_new, newshape=(len(LRT_max), self.B))
-        maxLRT_new = pd.DataFrame(maxLRT_new, columns=range(self.B))
+            allchangecluster = corref1['oldcluster'].to_list()
+            #need to change clusterid
+            mycluster1 = mycluster[mycluster['cluster'].isin(allchangecluster)]
+            a = mycluster1["cluster"].to_list()
+            b = corref1["oldcluster"].to_list()
+            idx1 = [ b.index(x) if x in b else None for x in a ]
+            mycluster1 = mycluster1.assign(cluster = corref1['newcluster'].iloc[idx1].to_list())
+            idx = np.where(mycluster.index.isin(mycluster1.index))[0]
+            mycluster.iloc[idx,0] = mycluster1['cluster']
 
-        maxLRT_new1 = maxLRT_new.max(axis=0).fillna(0)
-        maxLRT_new1 = maxLRT_new1.to_list()
-        LRT_alt_rank = pd.DataFrame(-np.array(LRT_alt.to_list() + maxLRT_new1))
-        LRT_alt_rank = LRT_alt_rank.rank(axis=0, na_option='bottom')[
-            0:len(LRT_alt)]
-        LRT_alt_rank = LRT_alt_rank - LRT_alt_rank.rank(axis=0)
+        allclusters = pd.concat([allclusters,mycluster])
+        
+    np.all(allclusters.index == cluster.index)    
+    allcluster = pd.Series(allclusters['cluster'],dtype='object',index=cluster.index)
+    return(allcluster)
 
-        FWER = LRT_alt_rank / self.B
-        DMseg_regions = pd.DataFrame(data=self.segments_alt, index=FDR.index)
 
-        DMseg_regions['p_value'] = p_value
-        DMseg_regions['FDR'] = FDR
-        DMseg_regions['FDR1'] = FDR1
-        DMseg_regions['FWER'] = FWER
-        DMseg_regions = DMseg_regions.loc[LRT_ord.index]
-        DMseg_regions = DMseg_regions[::-1]
 
-        # DMseg_regions.to_csv("/fh/fast/dai_j/Programs/DMseg1/DMseg/R/DMseg_segments_EAC_BE_regions1.csv")
-        return DMseg_regions
 
