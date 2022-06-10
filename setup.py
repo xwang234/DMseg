@@ -17,6 +17,6 @@ setup(name='DMseg',
       packages=['src'],
       install_requires=['pandas', 'numpy'],
       scripts=['src/dmseg'],
-      long_description=open('README.rst').read(),
+      long_description=open('README.md').read(),
       classifiers=["Topic :: Scientific/Engineering :: Bio-Informatics"],
  )
