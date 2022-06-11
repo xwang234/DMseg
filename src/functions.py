@@ -1,6 +1,11 @@
 #!/usr/bin/env python
+#include DVR
+#add p-value
+#add more permutations to long clusters
+#count a CpG into the DMR where it is a weak signal and is in the middle of strong signals.
+#add multipleprocessing
 """
-   functions used in DMseg.
+   Call DMseg.
 """
 from __future__ import print_function
 import numpy as np
@@ -400,7 +405,7 @@ def do_simulation1(beta,design,clusterindex,pos,chr,seed,diff_cutoff,zscore_cuto
     print("Permutation ends: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
     return allsimulation
 
-#get FWER based on NULL without stratification
+#get FWER based on NULL without adding extra permutations
 def compute_fwer1(DMseg_out,allsimulation,B,clusterindex,L1=0,L2=10):
     DMseg_out1 = DMseg_out[(DMseg_out['cluster_L']>L1) & (DMseg_out['cluster_L']<=L2)]
     LRT_alt = DMseg_out1['LRT']
@@ -454,7 +459,7 @@ def compute_fwer1(DMseg_out,allsimulation,B,clusterindex,L1=0,L2=10):
     #print(DMseg_out1.iloc[idx,:])
     return DMseg_out1
 
-#get all the FWER, FWER based on NULL without stratification
+#get all the FWER in all levels
 def compute_fwerall(DMseg_out,allsimulation,B,clusterindex,Ls=[0,10,20,30]):
     DMseg_out2 = pd.DataFrame()
     for i in range(len(Ls)):
@@ -470,7 +475,6 @@ def compute_fwerall(DMseg_out,allsimulation,B,clusterindex,Ls=[0,10,20,30]):
     return(DMseg_out2)
 
 
-#get p-values in stratified clusters
 #get p-values based on a single stratified set of NULL, for short clusters
 def compute_pvalue_short(DMseg_out,allsimulation,B,clusterwidth,L1=0,L2=10):
     shortclusters1 = clusterwidth.index[(clusterwidth>L1) & (clusterwidth<=L2)]
@@ -527,7 +531,7 @@ def compute_pvalue_short(DMseg_out,allsimulation,B,clusterwidth,L1=0,L2=10):
     result = dict(P_short=P_short,allsimulation_short=allsimulation_short)
     return result
 
-#get p values for long clusters
+#get p values for long clusters (adding more permutations)
 def compute_pvalue_long(DMseg_out,allsimulation,allsimulation2,B,B1,longclusters):
     DMseg_out_long = DMseg_out[DMseg_out['cluster'].isin(longclusters)]
     LRT_alt_long = DMseg_out_long['LRT']
@@ -593,7 +597,6 @@ def compute_pvalue_long(DMseg_out,allsimulation,allsimulation2,B,B1,longclusters
     result = dict(P_long=P_long,allsimulation_long500=allsimulation_long500)
     return result
 
-#to run 2 category case, set Ls=[0,20], the last level is for long clusters
 def compute_fwer_all (DMseg_out,allsimulation,allsimulation2,B,B1,longclusters,clusterwidth,Ls=[0,10,20]):
     P = pd.DataFrame()
     allsimulations = pd.DataFrame()
@@ -625,124 +628,6 @@ def compute_fwer_all (DMseg_out,allsimulation,allsimulation2,B,B1,longclusters,c
     DMseg_out1 = DMseg_out.assign(P=P,FWER=FWER)
     DMseg_out1 = DMseg_out1.sort_values(by=['FWER',"n_cpgs"], ascending=[True,False])
     #sum(DMseg_out1["FWER"]<=0.05)
-    return DMseg_out1
-
-#A specific case only for 2 categories: <=20 and >20,not used any more, to be deleted
-def compute_fwer_pvalue (DMseg_out,allsimulation,allsimulation2,B,B1,shortclusters,longclusters):
-    DMseg_out_short = DMseg_out[DMseg_out['cluster'].isin(shortclusters)]
-    LRT_alt_short = DMseg_out_short['LRT']
-    allsimulation_short = allsimulation[(allsimulation['cluster'].isin(shortclusters))]
-    allsimulation_short_grp = allsimulation_short.groupby(by="simulationidx")
-    # tmp=plt.hist(allsimulation1['LRT'])
-    # plt.xlabel("LRT")
-    # plt.show()
-    
-    #p-value of observed
-    LRT_alt_rank_short = pd.DataFrame(-np.array(LRT_alt_short.to_list() + allsimulation_short['LRT'].to_list()))
-    LRT_alt_rank_short = LRT_alt_rank_short.rank(axis=0, method='max')[0:len(LRT_alt_short)]
-    LRT_alt_rank_short = LRT_alt_rank_short - LRT_alt_rank_short.rank(axis=0, method='max')
-    
-    #multiple peaks can be found in a cluster, which increase the total number of test
-    multiplepeaksinacluster_short = allsimulation_short_grp['cluster'].value_counts().tolist()
-    #if one peak found in a cluster, no need to add the number 
-    multiplepeaksinacluster_short = [x-1 for x in multiplepeaksinacluster_short]
-    #total number of clusters in stratified data
-    numclusters_short = len(shortclusters)
-    totaltests_short = numclusters_short*B + sum(multiplepeaksinacluster_short)
-    
-    P_short = LRT_alt_rank_short / totaltests_short
-    P_short.index=DMseg_out_short.index.to_list()
-    P_short.columns=["P"]
-    # tmp=plt.hist(P_short)
-    # plt.xlabel("p-value")
-    # tmp=plt.hist(-np.log10(P_short['P']))
-    # plt.xlabel("-log10(p-value)")
-    # plt.show()
-    
-    #p-value of null
-    NULL_rank_short = pd.DataFrame(-np.array(allsimulation_short['LRT'].to_list()))
-    NULL_rank_short = NULL_rank_short.rank(axis=0, method='max')[0:len(NULL_rank_short)]
-    NULL_P_short = NULL_rank_short/totaltests_short
-    NULL_P_short.index = allsimulation_short.index
-    # tmp=plt.hist(NULL_P_short)
-    # plt.xlabel("p-value")
-    
-    # tmp=plt.hist(-np.log10(NULL_P_short))
-    # plt.xlabel("-log10(p-value)")
-    # plt.show()
-    allsimulation_short = allsimulation_short.assign(null_p=NULL_P_short.iloc[:,0].to_list())
-    
-    #for long clusters
-    DMseg_out_long = DMseg_out[DMseg_out['cluster'].isin(longclusters)]
-    LRT_alt_long = DMseg_out_long['LRT']
-    
-    #simulation in first 500
-    allsimulation_long500 = allsimulation[(allsimulation['cluster'].isin(longclusters))]
-    #extra simulation for long clusters
-    if allsimulation2['simulationidx'].min() < B:
-        allsimulation2['simulationidx'] = allsimulation2['simulationidx'] + B
-    #simulation in all 5000
-    allsimulation_long = pd.concat([allsimulation_long500,allsimulation2])
-    allsimulation_long_grp = allsimulation_long.groupby(by="simulationidx")
-    # tmp=plt.hist(allsimulation_long['LRT'])
-    # plt.xlabel("LRT")
-    # plt.show()
-    # tmp=plt.hist(allsimulation_long500['LRT'])
-    # plt.xlabel("LRT")
-    # plt.show()
-    
-    #p-value of observed
-    LRT_alt_rank_long = pd.DataFrame(-np.array(LRT_alt_long.to_list() + allsimulation_long['LRT'].to_list()))
-    LRT_alt_rank_long = LRT_alt_rank_long.rank(axis=0, method='max')[0:len(LRT_alt_long)]
-    LRT_alt_rank_long = LRT_alt_rank_long - LRT_alt_rank_long.rank(axis=0, method='max')
-    
-    #multiple peaks can be found in a cluster, which increase the total number of test
-    multiplepeaksinacluster_long = allsimulation_long_grp['cluster'].value_counts().tolist()
-    #if one peak found in a cluster, no need to add the number 
-    multiplepeaksinacluster_long = [x-1 for x in multiplepeaksinacluster_long]
-    #total number of clusters in stratified data
-    numclusters_long = len(longclusters)
-    totaltests_long = numclusters_long*(B+B1) + sum(multiplepeaksinacluster_long)
-    
-    P_long = LRT_alt_rank_long / totaltests_long
-    P_long.index=DMseg_out_long.index.to_list()
-    P_long.columns=["P"]
-    
-    # tmp=plt.hist(P_long)
-    # plt.xlabel("p-value")
-    # tmp=plt.hist(-np.log10(P_long['P']))
-    # plt.xlabel("-log10(p-value)")
-    # plt.show()
-    
-    #null p-value
-    NULL_rank_long500 = pd.DataFrame(-np.array(allsimulation_long500['LRT'].to_list() + allsimulation_long['LRT'].to_list()))
-    NULL_rank_long500 = NULL_rank_long500.rank(axis=0, method='max')[0:len(allsimulation_long500)]
-    NULL_rank_long500 = NULL_rank_long500 - NULL_rank_long500.rank(axis=0, method='max')    
-    NULL_P_long500 = NULL_rank_long500/totaltests_long
-    NULL_P_long500.index = allsimulation_long500.index
-    allsimulation_long500 = allsimulation_long500.assign(null_p=NULL_P_long500.iloc[:,0].to_list())
-    # tmp=plt.hist(NULL_P_long500)
-    # plt.xlabel("p-value")
-    # plt.savefig("/fh/fast/dai_j/Methods/DMseg/Results/test.png")
-    #allsimulation3['null_p'].min()
-    #all the nulls
-    allsimulation_null = pd.concat([allsimulation_short,allsimulation_long500])
-    allsimulation_null_grp = allsimulation_null.groupby(by="simulationidx")
-    NULL_Pmin = allsimulation_null_grp['null_p'].min().tolist()
-    if len(NULL_Pmin) < B:
-        NULL_Pmin.extend([1]*(B - len(NULL_Pmin)))
-    #tmp = pd.DataFrame(NULL_Pmin)
-    P = pd.concat([P_short,P_long])
-    P_alt_rank = pd.DataFrame(np.array(P.iloc[:,0].to_list() + NULL_Pmin))
-    P_alt_rank = P_alt_rank.rank(axis=0, method='max')[0:len(P)]
-    P_alt_rank.index = P.index
-    P_alt_rank = P_alt_rank - P_alt_rank.rank(axis=0, method='max')
-    
-    FWER = P_alt_rank / len(NULL_Pmin)
-    FWER.columns = ["FWER"]
-    
-    DMseg_out1 = DMseg_out.assign(P=P,FWER=FWER)
-    DMseg_out1 = DMseg_out1.sort_values(by=['FWER',"n_cpgs"], ascending=[True,False])
     return DMseg_out1
 
 
@@ -819,7 +704,3 @@ def merge_cluster (beta,chr,pos,cluster,maxmergegap=1000000,corr_cutoff=0.6):
     np.all(allclusters.index == cluster.index)    
     allcluster = pd.Series(allclusters['cluster'],dtype='object',index=cluster.index)
     return(allcluster)
-
-
-
-

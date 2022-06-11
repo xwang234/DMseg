@@ -10,9 +10,13 @@ This is a Python package to search through methylome-side CpGs sites for DMRs be
 
 To install the package: 
 
-```
-python setup.py install
-```
+* Installing locally using
+`
+python3 -m pip install .
+`
+* Installing from github
+`python3 -m pip install -e git+https://github.com/xwang234/DMseg
+`
 
 To run the python package
 
