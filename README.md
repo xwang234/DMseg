@@ -12,10 +12,11 @@ To install the package:
 
 * Installing locally using
 `
-python setup.py install
+python3 -m pip install .
 `
+
 * Installing from github
-`pip install git+https://github.com/xwang234/DMseg
+`python3 -m pip install -e git+https://github.com/xwang234/DMseg
 `
 
 To run the python package
