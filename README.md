@@ -14,6 +14,7 @@ To install the package:
 `
 python3 -m pip install .
 `
+
 * Installing from github
 `python3 -m pip install -e git+https://github.com/xwang234/DMseg
 `
