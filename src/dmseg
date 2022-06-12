@@ -116,7 +116,7 @@ def pipeline (betafile, colDatafile, positionfile, maxgap=500, sd_cutoff=0.025, 
             DMseg_out2 = compute_fwerall(DMseg_out,allsimulation,B,clusterindex,Ls=[0])
             #sum(DMseg_out2["FWER"]<0.05)
     DMseg_out2.to_csv(output, index=False)
-    print(DMseg_out2)
+    print(DMseg_out2[DMseg_out2["FWER"]<0.05])
     print(f"Output was written into {output}")
     print("Program ends: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
     

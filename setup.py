@@ -2,18 +2,17 @@
 #import ez_setup
 #ez_setup.use_setuptools()
 
-
+Version = "0.1.1"
+DESCRIPTION = 'Python package for DMseg: detecting differential methylation regions in DNA methylome data'
 from setuptools import setup, find_packages
-import src
-version = src.__version__
 
 setup(name='DMseg',
-      version=version,
-      description='DMseg',
+      version=Version,
       author='Kevin Wang',
       author_email='xwang234@fredhutch.org',
       license='MIT',
-      url='https://github.com/',
+            description=DESCRIPTION,
+      url='https://github.com/xwang234/DMseg',
       install_requires=['pandas', 'numpy'],
       packages=find_packages(),
       scripts=['src/dmseg'],
