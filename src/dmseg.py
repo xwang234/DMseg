@@ -6,13 +6,12 @@ from __future__ import print_function
 import numpy as np
 from time import localtime, strftime
 import pandas as pd
-import sys
-import os.path as op
 import multiprocessing as mp
 from src.functions import *
 
-def pipeline (betafile, colDatafile, positionfile, maxgap=500, sd_cutoff=0.025, diff_cutoff=0.05, zscore_cutoff=1.96,zscore_cutoff1=1.78, B=500, B1=4500, seed=1001, task="DMR",stratify=True,Ls=[0,10,20],mergecluster=True,corr_cutoff=0.6,ncore=4, output="output.csv"):
-    #import src.functions
+def pipeline (betafile, colDatafile, positionfile, maxgap=500, sd_cutoff=0.025, 
+diff_cutoff=0.05, zscore_cutoff=1.96, zscore_cutoff1=1.78, corr_cutoff=0.6, B=500, B1=4500, 
+seed=1001, task="DMR", Ls=[0,10,20], stratify=True, mergecluster=True, ncore=4, output="DMsegoutput.csv"):
     if ncore > mp.cpu_count()-1:
         ncore = mp.cpu_count()-1
     # the default option is DMR, testing regions with differential mean methylation
@@ -38,6 +37,7 @@ def pipeline (betafile, colDatafile, positionfile, maxgap=500, sd_cutoff=0.025, 
     clustergrp = cluster.groupby(cluster)
     len(clustergrp)  # 170156, 150676 after merging;epic 388459, 367483
     
+
     sum(clustergrp.value_counts()==1)   # 117604, most of clusters have 1 CpG
 
     clusterlen=clustergrp.filter(lambda x:len(x) > 1)
@@ -89,41 +89,39 @@ def pipeline (betafile, colDatafile, positionfile, maxgap=500, sd_cutoff=0.025, 
     DMseg_out2 = None
     #work on simulation data
     if len(DMseg_out) >0 :
-        start = time.time()
+        #start = time.time()
         if ncore>1:
             allsimulation = do_simulation1(beta,design,clusterindex,pos=pos,chr=chr,seed=seed,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1,B=B,ncore=ncore)
         else:
             allsimulation = do_simulation1serial(beta,design,clusterindex,pos=pos,chr=chr,seed=seed,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1,B=B)
-        end = time.time()
+        #end = time.time()
         #print(end-start)
+        tmp = clusterindex.groupby(clusterindex)
+        clusterwidth = tmp.count()
         if stratify: #new results, null stratified by cluster length
             #add extra permutation to cluster with #cpgs> 20
-            tmp = clusterindex.groupby(clusterindex)
-            clusterwidth = tmp.count()
+            
             longclusters = clusterwidth.index[clusterwidth > max(Ls)]
             #shortclusters = clusterwidth.index[clusterwidth <= max(Ls)]
             longcpgs = clusterindex.index[clusterindex.isin(longclusters)]
-             #use different seed to make sure top 500 are not the same as before
-            if ncore>1:
-                allsimulation2 = do_simulation1(beta.loc[longcpgs],design,clusterindex[longcpgs],pos=pos[longcpgs],chr=chr[longcpgs],seed=seed+10000+B1,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1,B=B1,ncore=ncore)
+            if len(longcpgs) > 0:
+                #use different seed to make sure top 500 are not the same as before
+                if ncore>1:
+                    allsimulation2 = do_simulation1(beta.loc[longcpgs],design,clusterindex[longcpgs],pos=pos[longcpgs],chr=chr[longcpgs],seed=seed+10000+B1,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1,B=B1,ncore=ncore)
+                else:
+                    allsimulation2 = do_simulation1serial(beta.loc[longcpgs],design,clusterindex[longcpgs],pos=pos[longcpgs],chr=chr[longcpgs],seed=seed+100000+B1,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1,B=B1)
+                DMseg_out2 = compute_fwer_all(DMseg_out,allsimulation,B,clusterwidth,allsimulation2,B1,longclusters,Ls)
             else:
-                allsimulation2 = do_simulation1serial(beta.loc[longcpgs],design,clusterindex[longcpgs],pos=pos[longcpgs],chr=chr[longcpgs],seed=seed+100000+B1,diff_cutoff=diff_cutoff,zscore_cutoff=zscore_cutoff,zscore_cutoff1=zscore_cutoff1,B=B1)
-        
-        
-            DMseg_out2 = compute_fwer_all(DMseg_out,allsimulation,allsimulation2,B,B1,longclusters,clusterwidth,Ls)
-            #print(sum(DMseg_out2["FWER"]<0.05))
+                DMseg_out2 = compute_fwer_all(DMseg_out,allsimulation,B,clusterwidth)
+            
         else:
-            DMseg_out2 = compute_fwerall(DMseg_out,allsimulation,B,clusterindex,Ls=[0])
-            #sum(DMseg_out2["FWER"]<0.05)
-    DMseg_out2.to_csv(output, index=False)
-    print(DMseg_out2[DMseg_out2["FWER"]<0.05])
-    print(f"Output was written into {output}")
+            DMseg_out2 = compute_fwer_all(DMseg_out,allsimulation,B,clusterwidth,Ls=[0])
+        #print(sum(DMseg_out2["FWER"]<0.05))
+        DMseg_out2.to_csv(output, index=False)
+        print("DMseg outputs were written to " + output)
     print("Program ends: " + strftime("%Y-%m-%d %H:%M:%S", localtime()))
     
     return DMseg_out2
-
-
-
 def main():
     import argparse
     p = argparse.ArgumentParser(description=__doc__,
@@ -146,7 +144,7 @@ def main():
     p.add_argument("-mergecluster", dest="mergecluster", help="Option of merging neighborhood clusters based on correlation of edge CpGs", default=True)
     p.add_argument("-corr_cutoff", dest="corr_cutoff", help="Cutoff used for merging neighborhood clusters", default=0.6)
     p.add_argument("-ncore", dest="ncore", help="number of CPU for parallel computation", default=4)
-    p.add_argument("-output", dest="output", help="output file", default="output.csv")
+    p.add_argument("-output", dest="output", help="output file", default="DMsegoutput.csv")
     args = p.parse_args()
     return pipeline(args.betafile, args.colDatafile, args.positionfile, args.maxgap, args.sd_cutoff, args.beta_diff_cutoff, args.zscore_cutoff, args.zscore_cutoff1, args.B, args.B1, args.seed, args.task, args.stratify, args.Ls, args.mergecluster, args.corr_cutoff, args.ncore)
 
