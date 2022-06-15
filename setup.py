@@ -15,7 +15,11 @@ setup(name='DMseg',
       url='https://github.com/xwang234/DMseg',
       install_requires=['pandas', 'numpy'],
       packages=find_packages(),
-      scripts=['src/dmseg'],
+            entry_points={ 
+            "console_scripts": [
+            "dmseg=src.dmseg:main",
+            ],
+            },
       long_description=open('README.md').read(),
       classifiers=["Topic :: Scientific/Engineering :: Bio-Informatics"],
       include_package_data=True,
