@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-Version = "0.1.1"
+Version = "0.1.2"
 DESCRIPTION = 'Python package for DMseg: detecting differential methylation regions in DNA methylome data'
 from setuptools import setup, find_packages
 
@@ -15,11 +15,11 @@ setup(name='DMseg',
       packages=find_packages(),
       entry_points={ 
             "console_scripts": [
-            "dmseg=src.dmseg:main",
+            "dmseg=DMseg.dmseg:main",
             ],
       },
       long_description=open('README.md').read(),
       classifiers=["Topic :: Scientific/Engineering :: Bio-Informatics"],
       include_package_data=True,
-      package_data={'': ['data/*.csv']},
+      package_data={'DMseg': ['data/*.csv', 'img/*.png']},
  )
