@@ -1,7 +1,12 @@
-## DMseg: detecting differential methylation regions (DMRs) in methylome 
+## DMseg: detecting differential methylation regions (DMRs) and variably methylated regions (VMR) in methylome 
 
+This is a Python package to search through methylome-side CpGs sites for DMRs between two biological conditions. 
+The following shows an example of DMR and VMR applying on the comparison of CpGs among Barrett's esophagus (BE), esophageal adenocarcinoma (EAC), and normal samples  
+<img src="./DMseg/img/DMR_VMR_example.png" alt="DMR and VMR exampls" width="600"/>
 
-This is a Python package to search through methylome-side CpGs sites for DMRs between two biological conditions. The algorithm executes the following analysis steps:
+The algorithm executes the following analysis steps:
+
+<img src="./DMseg/img/FlowChart.png" alt="Work flow" width="400"/>
 
 1.  A linear regression model is fitted to the beta values for each CpG, using the user-input covariates: the first variable is the group label of interest.
 2.  Nominal p-values from individual CpG associations are used to define the DMR: more than or equal to two consecutive CpGs with p-value <0.05 will be considered as candidate DMR. A likelihood ratio statistic (LRT) is computed for a candidate DMR.
@@ -16,11 +21,28 @@ python3 -m pip install .
 `
 
 * Installing from github
-`python3 -m pip install -e git+https://github.com/xwang234/DMseg
+`python3 -m pip install -e git+https://github.com/xwang234/DMseg.git#egg=DMseg
 `
 
-To run the python package
+To run an example data in Python
 
 ```
-result = dmseg(betafile, colDatafile, positionfile, maxgap=500, sd_cutoff=0.025, diff_cutoff=0.05, zscore_cutoff=1.96,zscore_cutoff1=1.78, B=500, B1=4500, seed=1001, task="DMR",stratify=True,Ls=[0,10,20],mergecluster=True,corr_cutoff=0.6,ncore=4)
+import pkg_resources
+from DMseg.dmseg import *
+betafile = pkg_resources.resource_filename('DMseg', 'data/example_beta.csv')
+colDatafile = pkg_resources.resource_filename('DMseg', 'data/example_colData.csv')
+positionfile = pkg_resources.resource_filename('DMseg', 'data/example_position.csv')
+DMseg_res = pipeline(betafile, colDatafile, positionfile)
+print(DMseg_res.loc[DMseg_res.FWER<0.05])
+```
+The above result shows detected DMR regions with FWER less than 0.05:
+```
+  cluster  cluster_L    chr   start_cpg  start_pos     end_cpg  end_pos  n_cpgs seg_mean         LRT         P   FWER
+0     145         10  chr10  cg05585149     695844  cg22656048   696356       9    0.129   78.452856  0.000012  0.002
+1     323          7  chr10  cg13771471    1505595  cg01446627  1508061       7    -0.19  105.524264  0.000012  0.002
+2     367          8  chr10  cg04724406    1712918  cg23631669  1713418       6    -0.15   69.025041  0.000035  0.004
+3      87         20  chr10  cg16977735     530714  cg08605347   533359      18   -0.092  128.186842  0.000166  0.024
+4     154          8  chr10  cg12808565     729259  cg18503829   729956       6   -0.133   54.479745  0.000201  0.028
+5     132          7  chr10  cg25354348     670562  cg17293868   671007       4   -0.143   51.040964  0.000260  0.034
+
 ```

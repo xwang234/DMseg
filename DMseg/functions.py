@@ -831,7 +831,7 @@ def compute_fwer_all(DMseg_out, allsimulation, B, clusterwidth, allsimulation2=N
     
     DMseg_out1 = DMseg_out.assign(P=P, FWER=FWER)
     DMseg_out1 = DMseg_out1.sort_values(by=['FWER', "n_cpgs"], ascending=[True, False])
-    DMseg_out1.reset_index(drop=True)
+    DMseg_out1.reset_index(drop=True, inplace=True)
     # sum(DMseg_out1["FWER"]<=0.05)
     return DMseg_out1
 
