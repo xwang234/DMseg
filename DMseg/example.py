@@ -8,4 +8,4 @@ positionfile = pkg_resources.resource_filename('DMseg', 'data/example_position.c
 
 DMseg_res = pipeline(betafile, colDatafile, positionfile)
 
-DMseg_res.loc[DMseg_res.FWER<0.05]
+print(DMseg_res.loc[DMseg_res.FWER<0.05])
